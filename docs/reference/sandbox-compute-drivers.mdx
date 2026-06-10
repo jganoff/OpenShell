@@ -72,6 +72,58 @@ Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Conf
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
+### Docker Driver Config Mounts
+
+Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
+accepts `bind` mounts when `[openshell.drivers.docker]` sets
+`enable_bind_mounts = true` in `gateway.toml`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+Docker local-driver named volumes created with bind options also expose
+gateway-host paths, so OpenShell treats them like bind mounts and requires
+`enable_bind_mounts = true`.
+
+Use a `volume` mount for existing Docker named volumes:
+
+```shell
+docker volume create openshell-work
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
+
+Use a `bind` mount only after enabling it in the Docker driver table:
+
+```toml
+[openshell.drivers.docker]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Docker mount schema:
+
+| Type | Fields |
+|---|---|
+| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+
+OpenShell rejects mount targets that replace the workspace root, container root,
+supervisor files, `/etc/openshell`, `/etc/openshell-tls`, authentication
+material, or network namespace paths. These checks do not make host bind mounts
+safe.
+
 ## Podman Driver
 
 [Podman](https://podman.io/)-backed sandboxes run as rootless containers on the gateway host. Use Podman for Linux workstation workflows that avoid a rootful Docker daemon.
@@ -83,6 +135,58 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+
+### Podman Driver Config Mounts
+
+Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
+mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
+`enable_bind_mounts = true` in `gateway.toml`. Host bind mounts expose gateway
+host paths to sandbox requests, so they are disabled by default.
+
+Use a `volume` mount for existing Podman named volumes:
+
+```shell
+podman volume create openshell-work
+
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
+
+Use a `bind` mount only after enabling it in the Podman driver table:
+
+```toml
+[openshell.drivers.podman]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Podman mount schema:
+
+| Type | Fields |
+|---|---|
+| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default). The named volume must already exist. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+| `image` | `source`, `target`, optional `read_only` (`true` by default). |
+
+Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
+config. OpenShell rejects mount targets that replace the workspace root,
+container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
+authentication material, or network namespace paths. These checks do not make
+host bind mounts safe.
 
 ## MicroVM Driver
 

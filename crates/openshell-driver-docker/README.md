@@ -36,6 +36,43 @@ contract:
 
 The agent child process does not retain these supervisor privileges.
 
+## Driver Config Mounts
+
+The gateway forwards the `docker` block from `--driver-config-json` to this
+driver. The driver accepts user-supplied `mounts` entries with these Docker
+mount types:
+
+- `bind`: mounts an absolute host path when `[openshell.drivers.docker]`
+  has `enable_bind_mounts = true`.
+- `volume`: mounts an existing Docker named volume. The driver validates that
+  the volume exists before provisioning and never creates or removes it.
+  Docker local-driver volumes created with bind options are treated as host
+  bind mounts and require `enable_bind_mounts = true`.
+- `tmpfs`: mounts an in-memory filesystem with optional `options`,
+  `size_bytes`, and `mode`.
+
+Host bind mounts are disabled by default because they expose gateway host
+paths to sandbox requests. Image mounts are not part of the Docker
+driver-config schema. The driver still uses internal bind mounts for
+OpenShell-owned supervisor, token, and TLS material.
+
+Docker `bind` mounts accept `source`, `target`, and optional `read_only`.
+Docker `volume` mounts may include `subpath`. User-supplied bind and volume
+mounts are read-only by default; set `read_only: false` to make them writable.
+Mount targets must be absolute container paths and must not replace the
+workspace root (`/sandbox`) or overlap OpenShell supervisor files,
+`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
+
+Example named-volume usage:
+
+```shell
+docker volume create openshell-work
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work"}]}}' \
+  -- claude
+```
+
 ## Supervisor Binary Resolution
 
 The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into

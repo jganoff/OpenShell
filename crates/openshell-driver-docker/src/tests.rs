@@ -75,6 +75,59 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        enable_bind_mounts: false,
+    }
+}
+
+fn json_struct(value: serde_json::Value) -> prost_types::Struct {
+    match json_value(value).kind {
+        Some(prost_types::value::Kind::StructValue(value)) => value,
+        _ => panic!("expected JSON object"),
+    }
+}
+
+fn json_value(value: serde_json::Value) -> prost_types::Value {
+    match value {
+        serde_json::Value::Null => prost_types::Value { kind: None },
+        serde_json::Value::Bool(value) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::BoolValue(value)),
+        },
+        serde_json::Value::Number(value) => prost_types::Value {
+            kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
+        },
+        serde_json::Value::String(value) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value)),
+        },
+        serde_json::Value::Array(values) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue {
+                    values: values.into_iter().map(json_value).collect(),
+                },
+            )),
+        },
+        serde_json::Value::Object(values) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: values
+                    .into_iter()
+                    .map(|(key, value)| (key, json_value(value)))
+                    .collect(),
+            })),
+        },
+    }
+}
+
+fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::models::Volume {
+    bollard::models::Volume {
+        name: "openshell-test-volume".to_string(),
+        driver: driver.to_string(),
+        mountpoint: "/var/lib/docker/volumes/openshell-test-volume/_data".to_string(),
+        created_at: None,
+        status: None,
+        labels: HashMap::new(),
+        scope: None,
+        cluster_volume: None,
+        options,
+        usage_data: None,
     }
 }
 
@@ -429,6 +482,12 @@ fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
 }
 
 #[test]
+fn docker_compute_config_disables_bind_mounts_by_default() {
+    let cfg = DockerComputeConfig::default();
+    assert!(!cfg.enable_bind_mounts);
+}
+
+#[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
@@ -520,6 +579,320 @@ fn build_binds_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_container_create_body_includes_driver_config_mounts() {
+    let mut sandbox = test_sandbox();
+    let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
+    template.driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work",
+                "read_only": true,
+                "subpath": "project-a"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/cache",
+                "options": ["nosuid", "size=1048576"],
+                "size_bytes": 1_048_576,
+                "mode": 511
+            }
+        ]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
+    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
+    assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(
+        mounts[0]
+            .volume_options
+            .as_ref()
+            .and_then(|options| options.subpath.as_deref()),
+        Some("project-a")
+    );
+    assert_eq!(mounts[1].typ, Some(MountTypeEnum::TMPFS));
+    assert_eq!(mounts[1].target.as_deref(), Some("/sandbox/cache"));
+    assert_eq!(
+        mounts[1]
+            .tmpfs_options
+            .as_ref()
+            .and_then(|options| options.size_bytes),
+        Some(1_048_576)
+    );
+}
+
+#[test]
+fn driver_config_defaults_volume_mounts_to_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work"
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_allows_explicit_writable_volume_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work",
+            "read_only": false
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(false));
+}
+
+#[test]
+fn driver_config_rejects_bind_mounts_unless_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("enable_bind_mounts = true"));
+}
+
+#[test]
+fn build_container_create_body_includes_bind_mounts_when_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host",
+            "read_only": true
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::BIND));
+    assert_eq!(mounts[0].source.as_deref(), Some("/host/path"));
+    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/host"));
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_rejects_relative_bind_sources_when_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "relative/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("bind source must be an absolute host path")
+    );
+}
+
+#[test]
+fn driver_config_rejects_image_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "image",
+            "source": "ghcr.io/acme/tools:latest",
+            "target": "/opt/tools"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("invalid docker driver_config"));
+}
+
+#[test]
+fn driver_config_rejects_reserved_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/etc/openshell/auth/custom"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("reserved OpenShell path"));
+}
+
+#[test]
+fn docker_local_volume_with_bind_option_is_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "none".to_string()),
+            ("o".to_string(), "rw,bind".to_string()),
+            ("device".to_string(), "/tmp/openshell".to_string()),
+        ]),
+    );
+
+    assert!(docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_local_volume_without_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "nfs".to_string()),
+            ("o".to_string(), "addr=127.0.0.1,rw".to_string()),
+            ("device".to_string(), ":/exports/openshell".to_string()),
+        ]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_nonlocal_volume_with_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "custom",
+        HashMap::from([("o".to_string(), "bind".to_string())]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
 }
 
 #[test]
