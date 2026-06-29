@@ -7,8 +7,10 @@
 
 mod activity_aggregator;
 mod denial_aggregator;
+pub mod event_source;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
+mod inpod;
 mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
@@ -67,8 +69,6 @@ use openshell_supervisor_network::opa::OpaEngine;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::sync::mpsc::UnboundedSender;
-#[cfg(target_os = "linux")]
-use tokio::time::timeout;
 
 /// Run a command in the sandbox.
 ///
@@ -200,8 +200,7 @@ pub async fn run_sandbox(
         provider_credential_expires_at_ms,
         dynamic_credentials,
     );
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut provider_env = provider_credentials.child_env_with_gcp_resolved();
+    let provider_env = provider_credentials.child_env_with_gcp_resolved();
 
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
@@ -219,23 +218,12 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    // Create the workload's network namespace. It is shared infrastructure:
-    // the proxy binds to its host-side veth IP, the bypass monitor reads
-    // /dev/kmsg from inside it, and the workload child / SSH sessions enter
-    // it via setns(). The RAII handle lives in this frame for the duration
-    // of the sandbox.
-    #[cfg(target_os = "linux")]
-    let netns = if network_enabled {
-        openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
-    } else {
-        None
-    };
-
-    // The denial channel is owned by the orchestrator: the proxy (in the
-    // networking leaf) and the bypass monitor (in the process leaf) both
-    // produce DenialEvents that the denial aggregator (orchestrator-side)
-    // consumes via the matching receiver. Both leaves are pure producers;
-    // the orchestrator owns the consumer task spawned below.
+    // Event channels are owned by the orchestrator: the proxy and the bypass
+    // monitor produce DenialEvents / activity records that the orchestrator's
+    // aggregators (spawned below) consume via the matching receiver. The
+    // producer senders are handed to the isolation backend, which wires them
+    // into the proxy (during `bind`) and the bypass monitor (during
+    // `start_agent`). Both leaves are pure producers.
     let (denial_tx, denial_rx, bypass_denial_tx): (
         Option<UnboundedSender<DenialEvent>>,
         _,
@@ -247,13 +235,7 @@ pub async fn run_sandbox(
     } else {
         (None, None, None)
     };
-    #[cfg(not(target_os = "linux"))]
-    drop(bypass_denial_tx);
 
-    // Anonymous activity channel: same orchestrator-owned pattern as the
-    // denial channel. The proxy and the bypass monitor both emit per-event
-    // activity records; the orchestrator-side aggregator drains, sanitizes,
-    // and flushes anonymous summaries to the gateway.
     let (activity_tx, activity_rx, bypass_activity_tx) = if sandbox_id.is_some() {
         let (tx, rx) =
             tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
@@ -262,38 +244,84 @@ pub async fn run_sandbox(
     } else {
         (None, None, None)
     };
-    #[cfg(not(target_os = "linux"))]
-    drop(bypass_activity_tx);
 
-    let networking = if network_enabled {
+    // Drive the isolation boundary through a runtime-selected backend (RFC 0012).
+    // The supervisor matches the boundary descriptor's backend id to the admitted
+    // backend, resolves its factory from the registry, and advances the boxed
+    // state chain: attach -> claim -> bind -> confirm -> start_agent. This
+    // lifecycle has no concrete-backend branch; swapping the registered factory
+    // swaps the backend. The transitions consume each prior state, so "no
+    // workload before the boundary is ready" is enforced by construction.
+    let policy_local_slot = Arc::new(std::sync::Mutex::new(None));
+
+    let config = inpod::InPodConfig {
+        network_enabled,
+        process_enabled,
+        opa_engine: opa_engine.clone(),
+        retained_proto,
+        entrypoint_pid: entrypoint_pid.clone(),
+        provider_credentials: provider_credentials.clone(),
+        provider_env: std::sync::Mutex::new(provider_env),
+        sandbox_name: sandbox_name_for_agg.clone(),
+        openshell_endpoint: openshell_endpoint_for_proxy.clone(),
+        inference_routes,
+        ssh_socket_path,
+        denial_tx: std::sync::Mutex::new(denial_tx),
+        activity_tx: std::sync::Mutex::new(activity_tx),
         #[cfg(target_os = "linux")]
-        let proxy_bind_ip = netns
-            .as_ref()
-            .map(openshell_supervisor_process::netns::NetworkNamespace::host_ip);
-        #[cfg(not(target_os = "linux"))]
-        let proxy_bind_ip: Option<std::net::IpAddr> = None;
-
-        Some(
-            openshell_supervisor_network::run::run_networking(
-                &policy,
-                proxy_bind_ip,
-                opa_engine.as_ref(),
-                retained_proto.as_ref(),
-                entrypoint_pid.clone(),
-                process_enabled,
-                &provider_credentials,
-                sandbox_id.as_deref(),
-                sandbox_name_for_agg.as_deref(),
-                openshell_endpoint_for_proxy.as_deref(),
-                inference_routes.as_deref(),
-                denial_tx,
-                activity_tx,
-            )
-            .await?,
-        )
-    } else {
-        None
+        bypass_denial_tx: std::sync::Mutex::new(bypass_denial_tx),
+        #[cfg(target_os = "linux")]
+        bypass_activity_tx: std::sync::Mutex::new(bypass_activity_tx),
+        policy_local_slot: policy_local_slot.clone(),
     };
+    #[cfg(not(target_os = "linux"))]
+    {
+        drop(bypass_denial_tx);
+        drop(bypass_activity_tx);
+    }
+
+    // The admitted backend for this sandbox. In-pod today; a real deployment
+    // derives this id (and the descriptor payload) from admission.
+    let admitted_backend_id = inpod::IN_POD_BACKEND_ID;
+    let mut registry = openshell_isolation::contract::BackendRegistry::new();
+    registry
+        .register(Arc::new(inpod::InPodBackendFactory::new(config)))
+        .map_err(|e| miette::miette!("failed to register in-pod backend: {e}"))?;
+
+    let descriptor = openshell_isolation::contract::BoundaryDescriptor {
+        version: openshell_isolation::contract::CONTRACT_VERSION,
+        backend_id: admitted_backend_id.to_string(),
+        payload: Vec::new(),
+    };
+    let (factory, verified) = registry
+        .resolve(descriptor, admitted_backend_id)
+        .map_err(|e| miette::miette!("backend resolution failed: {e}"))?;
+
+    let attached = factory
+        .attach(verified)
+        .await
+        .map_err(|e| miette::miette!("boundary attach failed: {e}"))?;
+
+    let claim = openshell_isolation::contract::ClaimContext {
+        sandbox_id: sandbox_id.clone().unwrap_or_default(),
+        policy,
+        agent: openshell_isolation::AgentSpec {
+            program: program.clone(),
+            args: args.to_vec(),
+            workdir,
+            timeout_secs,
+            interactive,
+        },
+        resource_binding: inpod::in_pod_resource_binding(),
+    };
+    let claimed = attached
+        .claim(claim)
+        .await
+        .map_err(|e| miette::miette!("boundary claim failed: {e}"))?;
+    let bound = claimed
+        .bind()
+        .await
+        .map_err(|e| miette::miette!("boundary bind failed: {e}"))?;
 
     // Spawn the denial-aggregator flush task. The aggregator drains denial
     // events from the proxy + bypass monitor, batches them, and ships
@@ -376,7 +404,10 @@ pub async fn run_sandbox(
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
-        let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
+        let poll_policy_local = policy_local_slot
+            .lock()
+            .expect("policy_local_slot lock")
+            .clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -406,88 +437,41 @@ pub async fn run_sandbox(
         });
     }
 
-    // Start GCE metadata loopback server inside the network namespace so
-    // Go's cloud.google.com/go/compute/metadata (which bypasses HTTP_PROXY)
-    // can reach it via direct TCP. Must start before the process leaf so SSH
-    // sessions also see corrected env vars on bind failure.
-    #[cfg(target_os = "linux")]
-    if let Some(ns) = netns.as_ref()
-        && provider_credentials
-            .snapshot()
-            .child_env
-            .contains_key("GCE_METADATA_HOST")
-    {
-        let ctx = google_cloud_metadata::MetadataContext::new(provider_credentials.clone());
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        match ns
-            .bind_tcp_in_netns(openshell_core::google_cloud::METADATA_LOOPBACK_ADDR)
-            .await
-        {
-            Ok(listener) => {
-                tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
-                if let Ok(Ok(addr)) = timeout(Duration::from_secs(5), ready_rx).await {
-                    info!(addr = %addr, "GCE metadata loopback server ready");
-                } else {
-                    warn!("GCE metadata server failed to become ready, removing metadata env vars");
-                    provider_env.remove("GCE_METADATA_HOST");
-                    provider_env.remove("GCE_METADATA_IP");
-                    provider_env.remove("METADATA_SERVER_DETECTION");
-                    provider_credentials.remove_env_key("GCE_METADATA_HOST");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "GCE metadata server bind failed, Go SDK may not discover credentials");
-                provider_env.remove("GCE_METADATA_HOST");
-                provider_env.remove("GCE_METADATA_IP");
-                provider_env.remove("METADATA_SERVER_DETECTION");
-                provider_credentials.remove_env_key("GCE_METADATA_HOST");
-            }
-        }
-    }
+    // Confirm effective readiness, then start the agent behind the boundary.
+    // Each transition consumes the prior state, so `start_agent` is unreachable
+    // until `confirm` has produced a ready boundary. In network-only (sidecar)
+    // mode the backend holds the boundary open until a shutdown signal instead
+    // of running an agent.
+    let ready = bound
+        .confirm()
+        .await
+        .map_err(|e| miette::miette!("boundary confirm failed: {e}"))?;
+    let running = ready
+        .start_agent()
+        .await
+        .map_err(|e| miette::miette!("agent start failed: {e}"))?;
 
-    let exit_code = if process_enabled {
-        let ca_file_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
-
-        openshell_supervisor_process::run::run_process(
-            program,
-            args,
-            workdir.as_deref(),
-            timeout_secs,
-            interactive,
-            sandbox_id.as_deref(),
-            openshell_endpoint.as_deref(),
-            ssh_socket_path,
-            &policy,
-            entrypoint_pid,
-            provider_credentials,
-            provider_env,
-            ca_file_paths,
-            #[cfg(target_os = "linux")]
-            netns.as_ref(),
-            #[cfg(target_os = "linux")]
-            bypass_denial_tx,
-            #[cfg(target_os = "linux")]
-            bypass_activity_tx,
-        )
-        .await?
-    } else {
-        // Network-only sidecar mode: keep the proxy and its background
-        // tasks alive (held via the `networking` value) until SIGINT or
-        // SIGTERM. Exit 0 on clean shutdown.
-        wait_for_shutdown_signal().await;
-        0
+    // Wait for the agent (or the held-open boundary) through its process handle.
+    let exit_status = running
+        .agent()
+        .wait()
+        .await
+        .map_err(|e| miette::miette!("waiting on agent failed: {e}"))?;
+    let exit_code = match exit_status {
+        openshell_isolation::contract::BoundaryExitStatus::Exited(code) => code,
+        openshell_isolation::contract::BoundaryExitStatus::Signaled(sig) => 128 + sig,
     };
 
-    // Drop networking explicitly so the proxy + bypass monitor RAII
-    // handles tear down before we return.
-    drop(networking);
+    // Drop the running boundary explicitly so the proxy + bypass monitor and the
+    // network namespace tear down before we return.
+    drop(running);
 
     Ok(exit_code)
 }
 
 /// Wait for SIGINT or SIGTERM. Used in network-only mode where there is
 /// no entrypoint child whose lifetime drives the supervisor's exit.
-async fn wait_for_shutdown_signal() {
+pub(crate) async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

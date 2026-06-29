@@ -11,8 +11,7 @@
 //! selection — it has no protocol awareness of the bytes flowing through.
 
 use std::net::IpAddr;
-#[cfg(target_os = "linux")]
-use std::os::fd::RawFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -21,6 +20,7 @@ use openshell_core::proto::{
     SupervisorHello, SupervisorMessage, TcpRelayTarget, gateway_message, relay_open,
     supervisor_message,
 };
+use openshell_isolation::contract::{BoundaryPortForward, LoopbackTarget};
 use openshell_ocsf::{
     ActivityId, ConnectionInfo, Endpoint, NetworkActivityBuilder, OcsfEvent, SandboxContext,
     SeverityId, StatusId, ocsf_emit,
@@ -234,13 +234,13 @@ pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    netns_fd: Option<i32>,
+    port_forward: Arc<dyn BoundaryPortForward>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session_loop(
         endpoint,
         sandbox_id,
         ssh_socket_path,
-        netns_fd,
+        port_forward,
     ))
 }
 
@@ -248,7 +248,7 @@ async fn run_session_loop(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    netns_fd: Option<i32>,
+    port_forward: Arc<dyn BoundaryPortForward>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -256,7 +256,14 @@ async fn run_session_loop(
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
+        match run_single_session(
+            &endpoint,
+            &sandbox_id,
+            &ssh_socket_path,
+            port_forward.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 let event =
                     session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
@@ -282,7 +289,7 @@ async fn run_single_session(
     endpoint: &str,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
+    port_forward: Arc<dyn BoundaryPortForward>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -351,7 +358,7 @@ async fn run_single_session(
                     &msg,
                     sandbox_id,
                     ssh_socket_path,
-                    netns_fd,
+                    &port_forward,
                     &channel,
                     &tx,
                 );
@@ -374,7 +381,7 @@ fn handle_gateway_message(
     msg: &GatewayMessage,
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
+    port_forward: &Arc<dyn BoundaryPortForward>,
     channel: &grpc_client::AuthedChannel,
     tx: &mpsc::Sender<SupervisorMessage>,
 ) {
@@ -389,13 +396,16 @@ fn handle_gateway_message(
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
             let tx = tx.clone();
+            let port_forward = port_forward.clone();
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
+                match handle_relay_open(relay_open, &ssh_socket_path, port_forward, channel, tx)
+                    .await
+                {
                     Ok(()) => {
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
@@ -445,12 +455,12 @@ fn handle_gateway_message(
 async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
+    port_forward: Arc<dyn BoundaryPortForward>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
-    let target = match open_target(&relay_open, ssh_socket_path, netns_fd).await {
+    let target = match open_target(&relay_open, ssh_socket_path, &port_forward).await {
         Ok(target) => target,
         Err(err) => {
             send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
@@ -575,10 +585,10 @@ async fn send_relay_open_result(
 async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
-    netns_fd: Option<i32>,
+    port_forward: &Arc<dyn BoundaryPortForward>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
-        Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
+        Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
             let stream = tokio::net::UnixStream::connect(ssh_socket_path).await?;
             Ok(Box::new(stream))
@@ -588,51 +598,25 @@ async fn open_target(
 
 async fn open_tcp_target(
     target: &TcpRelayTarget,
-    netns_fd: Option<i32>,
+    port_forward: &Arc<dyn BoundaryPortForward>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     let host = normalize_tcp_target_host(target)?;
     let port = u16::try_from(target.port).map_err(|_| "tcp target port must fit in u16")?;
-    let stream = connect_tcp_target(host, port, netns_fd).await?;
+    // `normalize_tcp_target_host` returns a loopback IP string; parse it and let
+    // `LoopbackTarget::new` re-validate before connecting.
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| "tcp target host must be a loopback IP")?;
+    let target = LoopbackTarget::new(ip, port)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    // Connect inside the boundary through the injected port-forward interface
+    // (RFC 0012). In-pod this enters the workload netns, a delegated backend
+    // tunnels into its guest.
+    let stream = port_forward
+        .connect(target)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     Ok(Box::new(stream))
-}
-
-#[cfg(target_os = "linux")]
-async fn connect_tcp_target(
-    host: String,
-    port: u16,
-    netns_fd: Option<RawFd>,
-) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(fd) = netns_fd {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> std::io::Result<std::net::TcpStream> {
-                #[allow(unsafe_code)]
-                let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                std::net::TcpStream::connect((host.as_str(), port))
-            })();
-            let _ = tx.send(result);
-        });
-
-        let stream = rx
-            .await
-            .map_err(|_| "netns tcp connect thread panicked")??;
-        stream.set_nonblocking(true)?;
-        return Ok(tokio::net::TcpStream::from_std(stream)?);
-    }
-
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn connect_tcp_target(
-    host: String,
-    port: u16,
-    _netns_fd: Option<i32>,
-) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
 }
 
 #[cfg(test)]

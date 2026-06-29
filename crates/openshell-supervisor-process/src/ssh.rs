@@ -108,6 +108,7 @@ pub async fn run_ssh_server(
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward>,
 ) -> Result<()> {
     let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
         Ok(v) => {
@@ -133,6 +134,7 @@ pub async fn run_ssh_server(
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
         let user_environment = user_environment.clone();
+        let port_forward = port_forward.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -145,6 +147,7 @@ pub async fn run_ssh_server(
                 ca_paths,
                 provider_credentials,
                 user_environment,
+                port_forward,
             )
             .await
             {
@@ -172,6 +175,7 @@ async fn handle_connection(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward>,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -195,6 +199,7 @@ async fn handle_connection(
         ca_file_paths,
         provider_credentials,
         user_environment,
+        port_forward,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -223,6 +228,10 @@ struct SshHandler {
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    /// Loopback port-forward, injected by the orchestrator (RFC 0012). In-pod
+    /// this connects from inside the workload netns; a delegated backend
+    /// tunnels into its guest. The handler does not know which.
+    port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -236,6 +245,7 @@ impl SshHandler {
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
+        port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward>,
     ) -> Self {
         Self {
             policy,
@@ -245,6 +255,7 @@ impl SshHandler {
             ca_file_paths,
             provider_credentials,
             user_environment,
+            port_forward,
             channels: HashMap::new(),
         }
     }
@@ -332,11 +343,19 @@ impl russh::server::Handler for SshHandler {
         // SSH protocol port is bounded by u32 but only u16 is meaningful;
         // saturate as a guard for malformed clients.
         let port = u16::try_from(port_to_connect).unwrap_or(u16::MAX);
-        let netns_fd = self.netns_fd;
+
+        // Build the loopback target up front. The host already passed
+        // `is_loopback_host`, and `LoopbackTarget::new` re-validates the parsed
+        // address (defense in depth) before the connect.
+        let Some(target) = loopback_ip(&host)
+            .and_then(|ip| openshell_isolation::contract::LoopbackTarget::new(ip, port).ok())
+        else {
+            return Ok(false);
+        };
+        let port_forward = self.port_forward.clone();
 
         tokio::spawn(async move {
-            let addr = format!("{host}:{port}");
-            let tcp = match connect_in_netns(&addr, netns_fd).await {
+            let mut tcp_stream = match port_forward.connect(target).await {
                 Ok(stream) => stream,
                 Err(err) => {
                     ocsf_emit!(
@@ -344,7 +363,9 @@ impl russh::server::Handler for SshHandler {
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
-                            .message(format!("direct-tcpip: failed to connect to {addr}: {err}"))
+                            .message(format!(
+                                "direct-tcpip: failed to connect to {host}:{port}: {err}"
+                            ))
                             .build()
                     );
                     let _ = channel.close().await;
@@ -353,7 +374,6 @@ impl russh::server::Handler for SshHandler {
             };
 
             let mut channel_stream = channel.into_stream();
-            let mut tcp_stream = tcp;
 
             let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut tcp_stream).await;
         });
@@ -1255,6 +1275,22 @@ fn is_loopback_host(host: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Resolve a (loopback-validated) destination host string to an `IpAddr`,
+/// mapping `localhost` to `127.0.0.1`.
+///
+/// Returns `None` for anything that does not parse to an IP, so
+/// [`LoopbackTarget::new`] never sees a hostname.
+fn loopback_ip(host: &str) -> Option<std::net::IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    host.parse().ok()
 }
 
 #[cfg(test)]
