@@ -19,10 +19,9 @@
 //! registry is the only lookup by `backend_id`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
 //!
-//! Increment status (POC): this module is the contract and is exercised by two
-//! mock factories and the conformance tests below. Migrating the live in-pod
-//! backend and supervisor onto it (and deleting the legacy associated-type
-//! `IsolationBackend` in `lib.rs`) is the next increment.
+//! The in-pod backend (`openshell-sandbox`) and the supervisor drive this
+//! contract directly; two mock factories and the conformance tests below
+//! exercise it against a second, heterogeneous backend.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -71,11 +70,41 @@ pub enum BackendError {
     Terminated(String),
 }
 
+/// Coarse, machine-readable classification of a [`BackendError`]. The error's
+/// variant and message carry the structured context (which operation failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendErrorKind {
+    /// Descriptor, version, backend, or capability mismatch.
+    Invalid,
+    /// Authenticated attachment or claim rejection.
+    Denied,
+    /// Boundary temporarily unavailable (the only retryable kind, at attach).
+    Unavailable,
+    /// Claim, bind, confirmation, start, or runtime operation failure.
+    Failed,
+    /// The boundary terminated.
+    Terminated,
+}
+
 impl BackendError {
     /// Whether the supervisor may retry, reusing the same backend and boundary.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Unavailable(_))
+    }
+
+    /// The machine-readable kind for this error.
+    #[must_use]
+    pub fn kind(&self) -> BackendErrorKind {
+        match self {
+            Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
+            Self::Attach(_) => BackendErrorKind::Denied,
+            Self::Unavailable(_) => BackendErrorKind::Unavailable,
+            Self::Claim(_) | Self::Bind(_) | Self::Confirm(_) | Self::Process(_) => {
+                BackendErrorKind::Failed
+            }
+            Self::Terminated(_) => BackendErrorKind::Terminated,
+        }
     }
 }
 
@@ -137,11 +166,33 @@ pub struct BoundaryDescriptor {
     pub payload: Vec<u8>,
 }
 
-/// A descriptor that has passed registry verification. Minted only by
-/// [`BackendRegistry::resolve`]; no public constructor, so an unverified
-/// descriptor cannot reach a factory.
+/// Trusted expectations from the authenticated admission record.
+///
+/// Retained by [`VerifiedBoundaryDescriptor`] after common verification. The
+/// supervisor checks the descriptor and factory against these; a backend cannot
+/// lower them.
+#[derive(Debug, Clone)]
+pub struct AdmittedBoundaryRequirements {
+    /// The backend admission selected.
+    pub backend_id: String,
+    /// The contract version that must match exactly.
+    pub contract_version: u32,
+    /// Digest of the admitted policy (opaque here).
+    pub policy_digest: Vec<u8>,
+    /// The confirmation mechanism the backend must provide.
+    pub required_confirmation: ConfirmationKind,
+    /// The minimum identity assurance the backend must reach.
+    pub minimum_identity: Assurance,
+}
+
+/// A descriptor that has passed registry verification against the admitted
+/// requirements.
+///
+/// Minted only by [`BackendRegistry::resolve`]; no public constructor, so an
+/// unverified descriptor cannot reach a factory.
 pub struct VerifiedBoundaryDescriptor {
     descriptor: BoundaryDescriptor,
+    requirements: AdmittedBoundaryRequirements,
 }
 
 impl VerifiedBoundaryDescriptor {
@@ -159,6 +210,11 @@ impl VerifiedBoundaryDescriptor {
     #[must_use]
     pub fn version(&self) -> u32 {
         self.descriptor.version
+    }
+    /// The admitted requirements this descriptor was verified against.
+    #[must_use]
+    pub fn requirements(&self) -> &AdmittedBoundaryRequirements {
+        &self.requirements
     }
 }
 
@@ -201,17 +257,19 @@ impl BackendRegistry {
         Ok(())
     }
 
-    /// Verify a descriptor against the admitted backend id and resolve its
+    /// Verify a descriptor against the admitted requirements and resolve its
     /// factory. Fails closed and never falls back to another backend:
     ///
     /// - the descriptor version must equal [`CONTRACT_VERSION`];
     /// - the descriptor's `backend_id` must equal the admitted id;
-    /// - a factory must be registered for that id; and
-    /// - the factory's advertised id and version must agree.
+    /// - a factory must be registered for that id, agreeing on its id;
+    /// - the factory's contract version must match the admitted version exactly;
+    /// - the factory must offer the required confirmation kind; and
+    /// - the factory's maximum identity must meet the admitted minimum.
     pub fn resolve(
         &self,
         descriptor: BoundaryDescriptor,
-        admitted_backend_id: &str,
+        requirements: &AdmittedBoundaryRequirements,
     ) -> Result<(Arc<dyn IsolationBackendFactory>, VerifiedBoundaryDescriptor), BackendError> {
         if descriptor.version != CONTRACT_VERSION {
             return Err(BackendError::Descriptor(format!(
@@ -219,10 +277,10 @@ impl BackendRegistry {
                 descriptor.version
             )));
         }
-        if descriptor.backend_id != admitted_backend_id {
+        if descriptor.backend_id != requirements.backend_id {
             return Err(BackendError::Descriptor(format!(
-                "descriptor backend {:?} does not match admitted backend {admitted_backend_id:?}",
-                descriptor.backend_id
+                "descriptor backend {:?} does not match admitted backend {:?}",
+                descriptor.backend_id, requirements.backend_id
             )));
         }
         let factory = self
@@ -230,7 +288,7 @@ impl BackendRegistry {
             .get(&descriptor.backend_id)
             .ok_or_else(|| BackendError::NotRegistered(descriptor.backend_id.clone()))?
             .clone();
-        // Defense in depth: the resolved factory must agree on id and version.
+        // Defense in depth: the resolved factory must agree on its id.
         if factory.backend_id() != descriptor.backend_id {
             return Err(BackendError::Descriptor(format!(
                 "registry returned backend {:?} for id {:?}",
@@ -238,13 +296,35 @@ impl BackendRegistry {
                 descriptor.backend_id
             )));
         }
-        if factory.capabilities().contract_version != CONTRACT_VERSION {
+        let caps = factory.capabilities();
+        if caps.contract_version != requirements.contract_version {
             return Err(BackendError::Descriptor(format!(
-                "backend {:?} contract version mismatch",
-                descriptor.backend_id
+                "backend {:?} speaks contract version {}, admission requires {}",
+                descriptor.backend_id, caps.contract_version, requirements.contract_version
             )));
         }
-        Ok((factory, VerifiedBoundaryDescriptor { descriptor }))
+        if !caps
+            .confirmation
+            .contains(&requirements.required_confirmation)
+        {
+            return Err(BackendError::Descriptor(format!(
+                "backend {:?} cannot provide required confirmation {:?}",
+                descriptor.backend_id, requirements.required_confirmation
+            )));
+        }
+        if caps.maximum_identity < requirements.minimum_identity {
+            return Err(BackendError::Descriptor(format!(
+                "backend {:?} maximum identity {:?} below admitted minimum {:?}",
+                descriptor.backend_id, caps.maximum_identity, requirements.minimum_identity
+            )));
+        }
+        Ok((
+            factory,
+            VerifiedBoundaryDescriptor {
+                descriptor,
+                requirements: requirements.clone(),
+            },
+        ))
     }
 }
 
@@ -286,37 +366,30 @@ pub enum BackendPlacement {
     OuterSandbox,
 }
 
-/// How a backend can confirm its boundary at readiness.
+/// How a backend confirms effective enforcement at readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmationCapability {
-    /// The supervisor reads the installed enforcement back directly.
-    SupervisorReadback,
-    /// The backend returns an attested statement the supervisor verifies.
-    Attested,
-}
-
-/// The strongest identity evidence a backend can produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityEvidenceKind {
-    /// Observed: the backend read and hashed the binary itself.
-    Observed,
-    /// Attested: fresh, boundary- and flow-bound evidence verified out of band.
+pub enum ConfirmationKind {
+    /// The supervisor observes effective enforcement directly.
+    Direct,
+    /// The backend returns verified attestation the supervisor checks.
     Attested,
 }
 
 /// What a backend supports, so admission can reject a workload it cannot place.
+///
+/// The backend id is the factory's; an exact contract version implies support
+/// for every field of that `SandboxPolicy` version. Confirmation kind and
+/// maximum identity assurance are the only negotiated security capabilities.
 #[derive(Debug, Clone)]
 pub struct BackendCapabilities {
-    /// The backend id (must match the factory and descriptor).
-    pub backend_id: String,
-    /// The contract version the backend speaks.
+    /// The contract version the backend speaks (matched exactly).
     pub contract_version: u32,
     /// Where it places enforcement.
     pub placement: BackendPlacement,
-    /// How it confirms readiness.
-    pub confirmation: ConfirmationCapability,
-    /// The identity evidence kinds it can produce.
-    pub identity: Vec<IdentityEvidenceKind>,
+    /// The confirmation mechanisms it can provide.
+    pub confirmation: Vec<ConfirmationKind>,
+    /// The strongest identity assurance it can produce.
+    pub maximum_identity: Assurance,
 }
 
 // ============================================================================
@@ -373,9 +446,24 @@ pub struct ClaimContext {
 // Lifecycle states
 // ============================================================================
 
+/// Boundary control retained by the supervisor from `attach`, independent of the
+/// lifecycle state.
+///
+/// `shutdown` is idempotent and owns cleanup on every terminal path;
+/// `wait_terminated` reports boundary loss distinct from agent exit.
+#[async_trait]
+pub trait BoundaryControl: Send + Sync {
+    /// Await boundary-level termination (distinct from agent exit).
+    async fn wait_terminated(&self) -> Result<(), BackendError>;
+    /// Idempotently release the boundary and its delegated resources.
+    async fn shutdown(&self) -> Result<(), BackendError>;
+}
+
 /// The exact admitted boundary, attached. No workload may run yet.
 #[async_trait]
 pub trait AttachedBoundary: Send {
+    /// Boundary control, retained by the supervisor across later transitions.
+    fn control(&self) -> Arc<dyn BoundaryControl>;
     /// Bind sandbox identity, policy, agent, and resources.
     async fn claim(
         self: Box<Self>,
@@ -393,6 +481,8 @@ pub trait ClaimedBoundary: Send {
 /// Mediation connected. Identity and events are available; the workload is not.
 #[async_trait]
 pub trait BoundBoundary: Send {
+    /// The proxy's backend-neutral source of workload connections.
+    fn mediation_ingress(&self) -> Arc<dyn MediationIngress>;
     /// The per-connection identity resolver (retained by the proxy).
     fn identity_source(&self) -> Arc<dyn IdentitySource>;
     /// The boundary event stream source (retained by the orchestrator).
@@ -414,14 +504,10 @@ pub trait ReadyBoundary: Send {
 pub trait RunningBoundary: Send + Sync {
     /// The agent process handle.
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
-    /// The per-connection identity resolver.
-    fn identity_source(&self) -> Arc<dyn IdentitySource>;
     /// The in-boundary exec interface.
     fn exec(&self) -> Arc<dyn BoundaryExec>;
     /// The loopback port-forward interface.
     fn port_forward(&self) -> Arc<dyn BoundaryPortForward>;
-    /// The boundary event stream source.
-    fn events(&self) -> Arc<dyn EventSource>;
 }
 
 // ============================================================================
@@ -562,6 +648,26 @@ pub type BoundaryConn = Box<dyn DuplexStream>;
 pub trait BoundaryPortForward: Send + Sync {
     /// Connect to `target` inside the boundary.
     async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryConn, BackendError>;
+}
+
+// ============================================================================
+// Mediation ingress
+// ============================================================================
+
+/// A workload connection delivered to the proxy, with its identity token.
+pub struct MediatedConnection {
+    /// The workload connection stream.
+    pub stream: BoundaryConn,
+    /// The opaque per-connection token the proxy resolves via [`IdentitySource`].
+    pub flow: Flow,
+}
+
+/// The proxy's backend-neutral source of workload connections. In-pod wraps the
+/// proxy's local listener; a delegated backend pulls from its private transport.
+#[async_trait]
+pub trait MediationIngress: Send + Sync {
+    /// Await the next mediated workload connection.
+    async fn accept(&self) -> Result<MediatedConnection, BackendError>;
 }
 
 // ============================================================================

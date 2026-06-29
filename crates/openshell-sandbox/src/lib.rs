@@ -293,14 +293,27 @@ pub async fn run_sandbox(
         backend_id: admitted_backend_id.to_string(),
         payload: Vec::new(),
     };
+    // The trusted requirements admission supplies. In-pod today; a real
+    // deployment derives these (and the policy digest) from the admission
+    // record. The supervisor checks the descriptor and factory against them.
+    let requirements = openshell_isolation::contract::AdmittedBoundaryRequirements {
+        backend_id: admitted_backend_id.to_string(),
+        contract_version: openshell_isolation::contract::CONTRACT_VERSION,
+        policy_digest: Vec::new(),
+        required_confirmation: openshell_isolation::contract::ConfirmationKind::Direct,
+        minimum_identity: openshell_isolation::contract::Assurance::None,
+    };
     let (factory, verified) = registry
-        .resolve(descriptor, admitted_backend_id)
+        .resolve(descriptor, &requirements)
         .map_err(|e| miette::miette!("backend resolution failed: {e}"))?;
 
     let attached = factory
         .attach(verified)
         .await
         .map_err(|e| miette::miette!("boundary attach failed: {e}"))?;
+    // Retain boundary control across the consuming transitions; the supervisor
+    // uses it to release the boundary after the agent exits.
+    let control = attached.control();
 
     let claim = openshell_isolation::contract::ClaimContext {
         sandbox_id: sandbox_id.clone().unwrap_or_default(),
@@ -462,8 +475,12 @@ pub async fn run_sandbox(
         openshell_isolation::contract::BoundaryExitStatus::Signaled(sig) => 128 + sig,
     };
 
-    // Drop the running boundary explicitly so the proxy + bypass monitor and the
-    // network namespace tear down before we return.
+    // Release the boundary through its control handle (idempotent), then drop
+    // the running boundary so the proxy + bypass monitor and the network
+    // namespace tear down before we return.
+    if let Err(e) = control.shutdown().await {
+        warn!(error = %e, "boundary shutdown reported an error");
+    }
     drop(running);
 
     Ok(exit_code)

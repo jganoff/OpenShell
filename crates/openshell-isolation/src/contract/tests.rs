@@ -24,7 +24,6 @@ use super::*;
 trait MockKind: Send + Sync + 'static {
     const BACKEND_ID: &'static str;
     fn assurance() -> Assurance;
-    fn evidence_kind() -> IdentityEvidenceKind;
 }
 
 struct Primary;
@@ -33,9 +32,6 @@ impl MockKind for Primary {
     fn assurance() -> Assurance {
         Assurance::Observed
     }
-    fn evidence_kind() -> IdentityEvidenceKind {
-        IdentityEvidenceKind::Observed
-    }
 }
 
 struct Secondary;
@@ -43,9 +39,6 @@ impl MockKind for Secondary {
     const BACKEND_ID: &'static str = "mock-secondary";
     fn assurance() -> Assurance {
         Assurance::Attested
-    }
-    fn evidence_kind() -> IdentityEvidenceKind {
-        IdentityEvidenceKind::Attested
     }
 }
 
@@ -85,6 +78,45 @@ impl BoundaryProcess for MockProcess {
     }
     fn diagnostic_pid(&self) -> Option<u32> {
         Some(4242)
+    }
+}
+
+/// Boundary control retained from `attach`: idempotent shutdown, terminate wait.
+struct MockControl {
+    shut_down: AtomicBool,
+}
+
+impl MockControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shut_down: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl BoundaryControl for MockControl {
+    async fn wait_terminated(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        // Idempotent: a second call is a no-op success.
+        self.shut_down.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Mediation ingress: hands the proxy a connection plus its flow token.
+struct MockIngress;
+
+#[async_trait]
+impl MediationIngress for MockIngress {
+    async fn accept(&self) -> Result<MediatedConnection, BackendError> {
+        let (near, _far) = tokio::io::duplex(64);
+        Ok(MediatedConnection {
+            stream: Box::new(near),
+            flow: Flow::in_pod_peer_port(40000),
+        })
     }
 }
 
@@ -192,31 +224,45 @@ impl BoundaryPortForward for MockPortForward {
 // Boxed lifecycle states (distinct concrete struct per kind).
 // ---------------------------------------------------------------------------
 
-struct MockAttached<K>(PhantomData<K>);
-struct MockClaimed<K>(PhantomData<K>);
+struct MockAttached<K> {
+    control: Arc<MockControl>,
+    _k: PhantomData<K>,
+}
+struct MockClaimed<K> {
+    control: Arc<MockControl>,
+    _k: PhantomData<K>,
+}
 struct MockBound<K> {
+    control: Arc<MockControl>,
+    ingress: Arc<MockIngress>,
     identity: Arc<MockIdentity<K>>,
     events: Arc<MockEvents>,
 }
 struct MockReady<K> {
-    identity: Arc<MockIdentity<K>>,
-    events: Arc<MockEvents>,
+    control: Arc<MockControl>,
+    _k: PhantomData<K>,
 }
 struct MockRunning<K> {
     process: Arc<MockProcess>,
-    identity: Arc<MockIdentity<K>>,
     exec: Arc<MockExec>,
     port_forward: Arc<MockPortForward>,
-    events: Arc<MockEvents>,
+    _control: Arc<MockControl>,
+    _k: PhantomData<K>,
 }
 
 #[async_trait]
 impl<K: MockKind> AttachedBoundary for MockAttached<K> {
+    fn control(&self) -> Arc<dyn BoundaryControl> {
+        self.control.clone()
+    }
     async fn claim(
         self: Box<Self>,
         _claim: ClaimContext,
     ) -> Result<Box<dyn ClaimedBoundary>, BackendError> {
-        Ok(Box::new(MockClaimed::<K>(PhantomData)))
+        Ok(Box::new(MockClaimed::<K> {
+            control: self.control,
+            _k: PhantomData,
+        }))
     }
 }
 
@@ -224,6 +270,8 @@ impl<K: MockKind> AttachedBoundary for MockAttached<K> {
 impl<K: MockKind> ClaimedBoundary for MockClaimed<K> {
     async fn bind(self: Box<Self>) -> Result<Box<dyn BoundBoundary>, BackendError> {
         Ok(Box::new(MockBound::<K> {
+            control: self.control,
+            ingress: Arc::new(MockIngress),
             identity: Arc::new(MockIdentity(PhantomData)),
             events: MockEvents::new(),
         }))
@@ -232,6 +280,9 @@ impl<K: MockKind> ClaimedBoundary for MockClaimed<K> {
 
 #[async_trait]
 impl<K: MockKind> BoundBoundary for MockBound<K> {
+    fn mediation_ingress(&self) -> Arc<dyn MediationIngress> {
+        self.ingress.clone()
+    }
     fn identity_source(&self) -> Arc<dyn IdentitySource> {
         self.identity.clone()
     }
@@ -240,8 +291,8 @@ impl<K: MockKind> BoundBoundary for MockBound<K> {
     }
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError> {
         Ok(Box::new(MockReady::<K> {
-            identity: self.identity,
-            events: self.events,
+            control: self.control,
+            _k: PhantomData,
         }))
     }
 }
@@ -251,10 +302,10 @@ impl<K: MockKind> ReadyBoundary for MockReady<K> {
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
         Ok(Box::new(MockRunning::<K> {
             process: MockProcess::new(),
-            identity: self.identity,
             exec: Arc::new(MockExec),
             port_forward: Arc::new(MockPortForward),
-            events: self.events,
+            _control: self.control,
+            _k: PhantomData,
         }))
     }
 }
@@ -263,17 +314,11 @@ impl<K: MockKind> RunningBoundary for MockRunning<K> {
     fn agent(&self) -> Arc<dyn BoundaryProcess> {
         self.process.clone()
     }
-    fn identity_source(&self) -> Arc<dyn IdentitySource> {
-        self.identity.clone()
-    }
     fn exec(&self) -> Arc<dyn BoundaryExec> {
         self.exec.clone()
     }
     fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
         self.port_forward.clone()
-    }
-    fn events(&self) -> Arc<dyn EventSource> {
-        self.events.clone()
     }
 }
 
@@ -286,11 +331,10 @@ impl<K: MockKind> IsolationBackendFactory for MockFactory<K> {
     }
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            backend_id: K::BACKEND_ID.to_string(),
             contract_version: CONTRACT_VERSION,
             placement: BackendPlacement::InPod,
-            confirmation: ConfirmationCapability::SupervisorReadback,
-            identity: vec![K::evidence_kind()],
+            confirmation: vec![ConfirmationKind::Direct],
+            maximum_identity: K::assurance(),
         }
     }
     async fn attach(
@@ -298,7 +342,10 @@ impl<K: MockKind> IsolationBackendFactory for MockFactory<K> {
         descriptor: VerifiedBoundaryDescriptor,
     ) -> Result<Box<dyn AttachedBoundary>, BackendError> {
         assert_eq!(descriptor.backend_id(), K::BACKEND_ID);
-        Ok(Box::new(MockAttached::<K>(PhantomData)))
+        Ok(Box::new(MockAttached::<K> {
+            control: MockControl::new(),
+            _k: PhantomData,
+        }))
     }
 }
 
@@ -320,6 +367,16 @@ fn descriptor(backend_id: &str) -> BoundaryDescriptor {
         version: CONTRACT_VERSION,
         backend_id: backend_id.to_string(),
         payload: vec![],
+    }
+}
+
+fn requirements(backend_id: &str) -> AdmittedBoundaryRequirements {
+    AdmittedBoundaryRequirements {
+        backend_id: backend_id.to_string(),
+        contract_version: CONTRACT_VERSION,
+        policy_digest: vec![],
+        required_confirmation: ConfirmationKind::Direct,
+        minimum_identity: Assurance::None,
     }
 }
 
@@ -351,11 +408,15 @@ async fn drive(
     descriptor: BoundaryDescriptor,
     admitted: &str,
 ) -> Result<Box<dyn RunningBoundary>, BackendError> {
-    let (factory, verified) = reg.resolve(descriptor, admitted)?;
+    let (factory, verified) = reg.resolve(descriptor, &requirements(admitted))?;
     let attached = factory.attach(verified).await?;
+    // Boundary control is retained from attach across consuming transitions.
+    let _control = attached.control();
     let claimed = attached.claim(claim_ctx()).await?;
     let bound = claimed.bind().await?;
-    // Identity and events are available at Bound; retain them as owned Arcs.
+    // Mediation, identity, and events are available at Bound; retain them as
+    // owned Arcs across the confirm/start transitions.
+    let _ingress = bound.mediation_ingress();
     let _early_identity = bound.identity_source();
     let _early_events = bound.events();
     let ready = bound.confirm().await?;
@@ -370,7 +431,10 @@ async fn drive(
 async fn registry_selects_correct_backend() {
     let reg = registry();
     let (f, _v) = reg
-        .resolve(descriptor("mock-secondary"), "mock-secondary")
+        .resolve(
+            descriptor("mock-secondary"),
+            &requirements("mock-secondary"),
+        )
         .expect("resolve");
     assert_eq!(f.backend_id(), "mock-secondary");
 }
@@ -390,7 +454,7 @@ fn registry_rejects_duplicate_registration() {
 fn registry_rejects_unknown_backend() {
     let reg = registry();
     let err = reg
-        .resolve(descriptor("nope"), "nope")
+        .resolve(descriptor("nope"), &requirements("nope"))
         .map(|_| ())
         .expect_err("unknown must fail");
     assert!(matches!(err, BackendError::NotRegistered(_)));
@@ -402,7 +466,7 @@ fn registry_rejects_descriptor_admission_mismatch_without_fallback() {
     // Descriptor names primary, admission says secondary: must fail, and must
     // not silently fall back to either backend.
     let err = reg
-        .resolve(descriptor("mock-primary"), "mock-secondary")
+        .resolve(descriptor("mock-primary"), &requirements("mock-secondary"))
         .map(|_| ())
         .expect_err("mismatch must fail");
     assert!(matches!(err, BackendError::Descriptor(_)));
@@ -414,10 +478,32 @@ fn registry_rejects_unsupported_version() {
     let mut d = descriptor("mock-primary");
     d.version = CONTRACT_VERSION + 1;
     let err = reg
-        .resolve(d, "mock-primary")
+        .resolve(d, &requirements("mock-primary"))
         .map(|_| ())
         .expect_err("bad version must fail");
     assert!(matches!(err, BackendError::Descriptor(_)));
+}
+
+#[test]
+fn registry_rejects_capability_shortfall() {
+    let reg = registry();
+    // Admission requires Attested identity; mock-primary's maximum is Observed.
+    let mut req = requirements("mock-primary");
+    req.minimum_identity = Assurance::Attested;
+    let err = reg
+        .resolve(descriptor("mock-primary"), &req)
+        .map(|_| ())
+        .expect_err("capability shortfall must fail");
+    assert!(matches!(err, BackendError::Descriptor(_)));
+    // Secondary (maximum Attested) satisfies the same requirement.
+    assert!(
+        reg.resolve(descriptor("mock-secondary"), &{
+            let mut r = requirements("mock-secondary");
+            r.minimum_identity = Assurance::Attested;
+            r
+        })
+        .is_ok()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -451,14 +537,15 @@ async fn one_driver_runs_both_backends() {
 async fn runtime_interfaces_survive_lifecycle_consumption() {
     let reg = registry();
     let (factory, verified) = reg
-        .resolve(descriptor("mock-primary"), "mock-primary")
+        .resolve(descriptor("mock-primary"), &requirements("mock-primary"))
         .expect("resolve");
     let attached = factory.attach(verified).await.expect("attach");
+    let control = attached.control();
     let claimed = attached.claim(claim_ctx()).await.expect("claim");
     let bound = claimed.bind().await.expect("bind");
 
     // Grab the identity source at Bound, then consume the bound state with
-    // confirm. The retained Arc must remain usable afterward.
+    // confirm. The retained Arcs must remain usable afterward.
     let identity = bound.identity_source();
     let ready = bound.confirm().await.expect("confirm");
     let _running = ready.start_agent().await.expect("start");
@@ -471,6 +558,9 @@ async fn runtime_interfaces_survive_lifecycle_consumption() {
         Identity::Evidence(e) => assert_eq!(e.assurance, Assurance::Observed),
         Identity::Unsupported => panic!("expected evidence"),
     }
+    // Control retained from attach is still usable; shutdown is idempotent.
+    control.shutdown().await.expect("shutdown");
+    control.shutdown().await.expect("idempotent shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +610,19 @@ async fn exec_session_owns_its_process_and_streams() {
         session.process.wait().await.expect("exec wait"),
         BoundaryExitStatus::Exited(0)
     );
+}
+
+#[tokio::test]
+async fn mediation_ingress_yields_connection_and_flow() {
+    let reg = registry();
+    let (factory, verified) = reg
+        .resolve(descriptor("mock-primary"), &requirements("mock-primary"))
+        .expect("resolve");
+    let attached = factory.attach(verified).await.expect("attach");
+    let claimed = attached.claim(claim_ctx()).await.expect("claim");
+    let bound = claimed.bind().await.expect("bind");
+    let conn = bound.mediation_ingress().accept().await.expect("accept");
+    assert_eq!(conn.flow, Flow::in_pod_peer_port(40000));
 }
 
 #[tokio::test]
@@ -577,4 +680,34 @@ async fn events_carry_denials_and_termination() {
         .count();
     assert_eq!(denials, 1);
     assert_eq!(terminated, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Errors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_kinds_map_and_only_unavailable_retries() {
+    assert_eq!(
+        BackendError::Descriptor("x".into()).kind(),
+        BackendErrorKind::Invalid
+    );
+    assert_eq!(
+        BackendError::Attach("x".into()).kind(),
+        BackendErrorKind::Denied
+    );
+    assert_eq!(
+        BackendError::Unavailable("x".into()).kind(),
+        BackendErrorKind::Unavailable
+    );
+    assert_eq!(
+        BackendError::Confirm("x".into()).kind(),
+        BackendErrorKind::Failed
+    );
+    assert_eq!(
+        BackendError::Terminated("x".into()).kind(),
+        BackendErrorKind::Terminated
+    );
+    assert!(BackendError::Unavailable("x".into()).is_retryable());
+    assert!(!BackendError::Confirm("x".into()).is_retryable());
 }

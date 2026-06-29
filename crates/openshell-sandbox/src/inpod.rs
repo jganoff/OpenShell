@@ -31,12 +31,12 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::policy::NetworkMode;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation::contract::{
-    AttachedBoundary, BackendCapabilities, BackendError, BackendPlacement, BoundBoundary,
-    BoundaryEvent, BoundaryExec, BoundaryExitStatus, BoundaryPortForward, BoundaryProcess,
-    BoundarySignal, CONTRACT_VERSION, ClaimContext, ClaimedBoundary, ConfirmationCapability,
-    EventSource, ExecSession, ExecSpec, IdentityEvidenceKind, IdentitySource,
-    IsolationBackendFactory, ReadyBoundary, ResourceBinding, RunningBoundary,
-    VerifiedBoundaryDescriptor,
+    Assurance, AttachedBoundary, BackendCapabilities, BackendError, BackendPlacement,
+    BoundBoundary, BoundaryControl, BoundaryEvent, BoundaryExec, BoundaryExitStatus,
+    BoundaryPortForward, BoundaryProcess, BoundarySignal, CONTRACT_VERSION, ClaimContext,
+    ClaimedBoundary, ConfirmationKind, EventSource, ExecSession, ExecSpec, IdentitySource,
+    IsolationBackendFactory, MediatedConnection, MediationIngress, ReadyBoundary, ResourceBinding,
+    RunningBoundary, VerifiedBoundaryDescriptor,
 };
 use openshell_supervisor_network::identity_source::ProcfsIdentitySource;
 use openshell_supervisor_network::opa::OpaEngine;
@@ -178,14 +178,13 @@ impl IsolationBackendFactory for InPodBackendFactory {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            backend_id: IN_POD_BACKEND_ID.to_string(),
             contract_version: CONTRACT_VERSION,
             placement: BackendPlacement::InPod,
-            // Readiness is confirmed by the supervisor reading back the
-            // established mediation (netns + bound proxy listener).
-            confirmation: ConfirmationCapability::SupervisorReadback,
+            // The supervisor observes effective enforcement directly (netns +
+            // bound proxy listener), so it confirms without attestation.
+            confirmation: vec![ConfirmationKind::Direct],
             // procfs read-and-hash of the connecting binary.
-            identity: vec![IdentityEvidenceKind::Observed],
+            maximum_identity: Assurance::Observed,
         }
     }
 
@@ -199,7 +198,53 @@ impl IsolationBackendFactory for InPodBackendFactory {
             .expect("in-pod config lock")
             .take()
             .ok_or_else(|| BackendError::Attach("in-pod backend already attached".to_string()))?;
-        Ok(Box::new(InPodAttached { config }))
+        Ok(Box::new(InPodAttached {
+            config,
+            control: Arc::new(InPodControl::new()),
+        }))
+    }
+}
+
+/// Boundary control retained by the supervisor from `attach`. For the in-pod
+/// placement the boundary's resources are released by RAII when the running
+/// boundary is dropped; `shutdown` is the idempotent control entry point that
+/// marks termination (and fires for early/orphan teardown paths), and
+/// `wait_terminated` reports boundary loss distinct from agent exit.
+struct InPodControl {
+    terminated: tokio::sync::Notify,
+    shut_down: std::sync::atomic::AtomicBool,
+}
+
+impl InPodControl {
+    fn new() -> Self {
+        Self {
+            terminated: tokio::sync::Notify::new(),
+            shut_down: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Mark the boundary terminated and wake any `wait_terminated` waiter.
+    fn mark_terminated(&self) {
+        self.shut_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.terminated.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl BoundaryControl for InPodControl {
+    async fn wait_terminated(&self) -> Result<(), BackendError> {
+        if self.shut_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.terminated.notified().await;
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        // Idempotent: a second call is a no-op success.
+        self.mark_terminated();
+        Ok(())
     }
 }
 
@@ -210,10 +255,15 @@ impl IsolationBackendFactory for InPodBackendFactory {
 /// Attached: the in-pod boundary's collaborators are held; nothing established.
 struct InPodAttached {
     config: InPodConfig,
+    control: Arc<InPodControl>,
 }
 
 #[async_trait]
 impl AttachedBoundary for InPodAttached {
+    fn control(&self) -> Arc<dyn BoundaryControl> {
+        self.control.clone()
+    }
+
     async fn claim(
         self: Box<Self>,
         claim: ClaimContext,
@@ -230,6 +280,7 @@ impl AttachedBoundary for InPodAttached {
 
         Ok(Box::new(InPodClaimed {
             config: self.config,
+            control: self.control,
             claim,
             #[cfg(target_os = "linux")]
             netns,
@@ -241,6 +292,7 @@ impl AttachedBoundary for InPodAttached {
 /// the network namespace exists.
 struct InPodClaimed {
     config: InPodConfig,
+    control: Arc<InPodControl>,
     claim: ClaimContext,
     #[cfg(target_os = "linux")]
     netns: Option<NetworkNamespace>,
@@ -251,6 +303,7 @@ impl ClaimedBoundary for InPodClaimed {
     async fn bind(self: Box<Self>) -> Result<Box<dyn BoundBoundary>, BackendError> {
         let this = *self;
         let config = this.config;
+        let control = this.control;
         let claim = this.claim;
         #[cfg(target_os = "linux")]
         let netns = this.netns;
@@ -314,12 +367,19 @@ impl ClaimedBoundary for InPodClaimed {
         let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel();
         let events: Arc<dyn EventSource> = Arc::new(InPodEvents::new(evt_rx));
 
+        // The proxy's backend-neutral connection source. The live in-pod proxy
+        // still accepts directly (see `InPodMediationIngress`); this satisfies
+        // the contract and a delegated backend supplies a guest-tunnel version.
+        let mediation_ingress: Arc<dyn MediationIngress> = Arc::new(InPodMediationIngress);
+
         Ok(Box::new(InPodBound {
             config,
+            control,
             claim,
             #[cfg(target_os = "linux")]
             netns,
             networking,
+            mediation_ingress,
             identity_source,
             events,
             evt_tx,
@@ -327,13 +387,16 @@ impl ClaimedBoundary for InPodClaimed {
     }
 }
 
-/// Bound: mediation is connected. Identity and events are available.
+/// Bound: mediation is connected. Mediation ingress, identity, and events are
+/// available.
 struct InPodBound {
     config: InPodConfig,
+    control: Arc<InPodControl>,
     claim: ClaimContext,
     #[cfg(target_os = "linux")]
     netns: Option<NetworkNamespace>,
     networking: Option<Networking>,
+    mediation_ingress: Arc<dyn MediationIngress>,
     identity_source: Arc<dyn IdentitySource>,
     events: Arc<dyn EventSource>,
     evt_tx: UnboundedSender<BoundaryEvent>,
@@ -341,6 +404,10 @@ struct InPodBound {
 
 #[async_trait]
 impl BoundBoundary for InPodBound {
+    fn mediation_ingress(&self) -> Arc<dyn MediationIngress> {
+        self.mediation_ingress.clone()
+    }
+
     fn identity_source(&self) -> Arc<dyn IdentitySource> {
         self.identity_source.clone()
     }
@@ -388,12 +455,11 @@ impl BoundBoundary for InPodBound {
 
         Ok(Box::new(InPodReady {
             config: self.config,
+            control: self.control,
             claim: self.claim,
             #[cfg(target_os = "linux")]
             netns: self.netns,
             networking: self.networking,
-            identity_source: self.identity_source,
-            events: self.events,
             evt_tx: self.evt_tx,
         }))
     }
@@ -402,12 +468,11 @@ impl BoundBoundary for InPodBound {
 /// Ready: enforcement and mediation are confirmed. Only agent start is allowed.
 struct InPodReady {
     config: InPodConfig,
+    control: Arc<InPodControl>,
     claim: ClaimContext,
     #[cfg(target_os = "linux")]
     netns: Option<NetworkNamespace>,
     networking: Option<Networking>,
-    identity_source: Arc<dyn IdentitySource>,
-    events: Arc<dyn EventSource>,
     evt_tx: UnboundedSender<BoundaryEvent>,
 }
 
@@ -416,6 +481,7 @@ impl ReadyBoundary for InPodReady {
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
         let this = *self;
         let config = this.config;
+        let control = this.control;
         let claim = this.claim;
         #[cfg(target_os = "linux")]
         let netns = this.netns;
@@ -485,10 +551,9 @@ impl ReadyBoundary for InPodReady {
 
         Ok(Box::new(InPodRunning {
             agent,
-            identity_source: this.identity_source,
+            control,
             exec,
             port_forward,
-            events: this.events,
             evt_tx: this.evt_tx,
             _networking: networking,
             #[cfg(target_os = "linux")]
@@ -498,13 +563,13 @@ impl ReadyBoundary for InPodReady {
 }
 
 /// Running: the agent is started behind the boundary. Exec, connect, wait, and
-/// signal are available.
+/// signal are available. Identity, events, and mediation ingress were retained
+/// by the supervisor from the `Bound` state.
 struct InPodRunning {
     agent: Arc<dyn BoundaryProcess>,
-    identity_source: Arc<dyn IdentitySource>,
+    control: Arc<InPodControl>,
     exec: Arc<dyn BoundaryExec>,
     port_forward: Arc<dyn BoundaryPortForward>,
-    events: Arc<dyn EventSource>,
     evt_tx: UnboundedSender<BoundaryEvent>,
     /// Held to keep the proxy task and network namespace alive for the boundary's
     /// life; dropped (with the running state) tears them down.
@@ -517,24 +582,21 @@ impl RunningBoundary for InPodRunning {
     fn agent(&self) -> Arc<dyn BoundaryProcess> {
         self.agent.clone()
     }
-    fn identity_source(&self) -> Arc<dyn IdentitySource> {
-        self.identity_source.clone()
-    }
     fn exec(&self) -> Arc<dyn BoundaryExec> {
         self.exec.clone()
     }
     fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
         self.port_forward.clone()
     }
-    fn events(&self) -> Arc<dyn EventSource> {
-        self.events.clone()
-    }
 }
 
 impl Drop for InPodRunning {
     fn drop(&mut self) {
-        // Surface boundary teardown on the event stream so a subscriber is not
-        // left silently waiting. Best-effort: the receiver may already be gone.
+        // RAII teardown: dropping `_networking`/`_netns` releases the boundary.
+        // Mark the control terminated and surface the event so neither a
+        // `wait_terminated` waiter nor an event subscriber is left hanging.
+        // Best-effort: the event receiver may already be gone.
+        self.control.mark_terminated();
         let _ = self.evt_tx.send(BoundaryEvent::BoundaryTerminated {
             reason: "in-pod boundary torn down".to_string(),
         });
@@ -649,6 +711,24 @@ impl BoundaryExec for InPodExec {
         Err(BackendError::Process(
             "in-pod BoundaryExec is not yet the live SSH exec path; SSH execs directly. \
              Wiring ExecSession stdio/PTY through this interface is pending (see POC handoff)."
+                .to_string(),
+        ))
+    }
+}
+
+/// In-pod mediation ingress. The live in-pod proxy still accepts workload
+/// connections on its own listener inside the netns; routing those through
+/// `accept` (so a delegated backend can deliver connections over a guest
+/// tunnel instead) is the remaining live-adoption refactor, so this returns an
+/// explicit error rather than a competing accept loop.
+struct InPodMediationIngress;
+
+#[async_trait]
+impl MediationIngress for InPodMediationIngress {
+    async fn accept(&self) -> Result<MediatedConnection, BackendError> {
+        Err(BackendError::Process(
+            "in-pod MediationIngress is not yet the live proxy connection source; \
+             the proxy accepts directly (see POC handoff)."
                 .to_string(),
         ))
     }
@@ -773,6 +853,18 @@ mod tests {
         }
     }
 
+    fn requirements(
+        backend_id: &str,
+    ) -> openshell_isolation::contract::AdmittedBoundaryRequirements {
+        openshell_isolation::contract::AdmittedBoundaryRequirements {
+            backend_id: backend_id.to_string(),
+            contract_version: CONTRACT_VERSION,
+            policy_digest: Vec::new(),
+            required_confirmation: ConfirmationKind::Direct,
+            minimum_identity: Assurance::None,
+        }
+    }
+
     // ----- Resource binding / execution domain -----
 
     #[test]
@@ -809,7 +901,8 @@ mod tests {
         let caps = factory.capabilities();
         assert_eq!(caps.contract_version, CONTRACT_VERSION);
         assert_eq!(caps.placement, BackendPlacement::InPod);
-        assert!(caps.identity.contains(&IdentityEvidenceKind::Observed));
+        assert_eq!(caps.maximum_identity, Assurance::Observed);
+        assert!(caps.confirmation.contains(&ConfirmationKind::Direct));
     }
 
     #[test]
@@ -819,7 +912,7 @@ mod tests {
             .register(Arc::new(InPodBackendFactory::new(minimal_config())))
             .expect("register");
         let (factory, _verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+            .resolve(descriptor(), &requirements(IN_POD_BACKEND_ID))
             .expect("resolve");
         assert_eq!(factory.backend_id(), IN_POD_BACKEND_ID);
     }
@@ -847,7 +940,7 @@ mod tests {
         };
         assert!(
             registry
-                .resolve(descriptor, "nonexistent")
+                .resolve(descriptor, &requirements("nonexistent"))
                 .map(|_| ())
                 .is_err()
         );
@@ -862,7 +955,7 @@ mod tests {
         // The descriptor names in-pod, but admission expects a different backend.
         assert!(
             registry
-                .resolve(descriptor(), "some-other-backend")
+                .resolve(descriptor(), &requirements("some-other-backend"))
                 .map(|_| ())
                 .is_err()
         );
@@ -880,7 +973,7 @@ mod tests {
             .register(Arc::new(InPodBackendFactory::new(minimal_config())))
             .expect("register");
         let (factory, verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+            .resolve(descriptor(), &requirements(IN_POD_BACKEND_ID))
             .expect("resolve");
 
         let attached = factory.attach(verified).await.expect("attach");
@@ -914,7 +1007,7 @@ mod tests {
             .register(Arc::new(InPodBackendFactory::new(minimal_config())))
             .expect("register");
         let (factory, verified) = registry
-            .resolve(descriptor(), IN_POD_BACKEND_ID)
+            .resolve(descriptor(), &requirements(IN_POD_BACKEND_ID))
             .expect("resolve");
         let attached = factory.attach(verified).await.expect("attach");
         let claim = ClaimContext {
