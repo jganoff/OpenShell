@@ -10,6 +10,8 @@ pub mod vm;
 
 #[cfg(not(target_os = "windows"))]
 pub use openshell_driver_docker::DockerComputeConfig;
+#[cfg(feature = "docker-sandboxes-in-tree")]
+pub use openshell_driver_docker_sandboxes::DockerSandboxesComputeConfig;
 #[cfg(not(target_os = "windows"))]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
 #[cfg(not(target_os = "windows"))]
@@ -50,6 +52,8 @@ use openshell_core::proto::{
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_docker::DockerComputeDriver;
+#[cfg(feature = "docker-sandboxes-in-tree")]
+use openshell_driver_docker_sandboxes::DockerSandboxesComputeDriver;
 #[cfg(not(target_os = "windows"))]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
@@ -834,6 +838,48 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
+            driver,
+            None,
+            None,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+        )
+        .await
+    }
+
+    /// Local-development convenience only — see the `docker-sandboxes-in-tree`
+    /// feature doc comment in `Cargo.toml`. Released builds run this driver
+    /// out-of-tree via `ConfiguredComputeDriver::Remote` instead.
+    #[cfg(feature = "docker-sandboxes-in-tree")]
+    pub async fn new_docker_sandboxes(
+        openshell_config: openshell_core::Config,
+        docker_sandboxes_config: DockerSandboxesComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let grpc_endpoint = format!(
+            "http://host.docker.internal:{}",
+            openshell_config.bind_address.port()
+        );
+        let driver = Arc::new(
+            DockerSandboxesComputeDriver::new(
+                &grpc_endpoint,
+                &openshell_config.log_level,
+                &docker_sandboxes_config,
+            )
+            .await
+            .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let driver: SharedComputeDriver = driver;
+        Self::from_driver(
+            ComputeDriverKind::DockerSandboxes.as_str().to_string(),
             driver,
             None,
             None,

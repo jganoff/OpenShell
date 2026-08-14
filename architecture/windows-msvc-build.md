@@ -54,6 +54,14 @@ build artifacts, including artifacts from failed runs. Keep the workflow manual
 until cache-hit runtimes demonstrate that it is suitable for pull requests and
 merges to `main`.
 
+Branch Checks carries a narrow `Rust (Windows)` job that lints and tests only
+the crates with real `#[cfg(windows)]` transport code — currently
+`openshell-driver-docker-sandboxes`, whose sandboxd client dials a named pipe.
+That code cannot be executed by any Linux or macOS job, so it runs per pull
+request on a Windows runner while the full MSVC workspace lane stays manual.
+Keep the job crate-scoped: it takes its toolchain from rustup rather than mise,
+and it is not a second home for whole-workspace Windows validation.
+
 Windows validation is exposed through `tasks/windows.toml`:
 
 | Task | Purpose |

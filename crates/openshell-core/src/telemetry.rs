@@ -165,6 +165,8 @@ pub enum TelemetryComputeDriver {
     Kubernetes,
     Podman,
     Vm,
+    #[cfg(feature = "docker-sandboxes")]
+    DockerSandboxes,
     Unknown,
 }
 
@@ -176,6 +178,8 @@ impl TelemetryComputeDriver {
             Self::Kubernetes => "kubernetes",
             Self::Podman => "podman",
             Self::Vm => "vm",
+            #[cfg(feature = "docker-sandboxes")]
+            Self::DockerSandboxes => "docker-sandboxes",
             Self::Unknown => "unknown",
         }
     }
@@ -187,6 +191,8 @@ impl TelemetryComputeDriver {
             "k8s" | "kubernetes" => Self::Kubernetes,
             "podman" => Self::Podman,
             "vm" => Self::Vm,
+            #[cfg(feature = "docker-sandboxes")]
+            "docker-sandboxes" => Self::DockerSandboxes,
             _ => Self::Unknown,
         }
     }
@@ -198,6 +204,8 @@ impl TelemetryComputeDriver {
             Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
             Some(crate::ComputeDriverKind::Podman) => Self::Podman,
             Some(crate::ComputeDriverKind::Vm) => Self::Vm,
+            #[cfg(feature = "docker-sandboxes")]
+            Some(crate::ComputeDriverKind::DockerSandboxes) => Self::DockerSandboxes,
             None => Self::Unknown,
         }
     }

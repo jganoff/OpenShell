@@ -388,6 +388,8 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        #[cfg(feature = "docker-sandboxes-in-tree")]
+        Some(ComputeDriverKind::DockerSandboxes) => &["default_image"],
         None => &[],
     }
 }

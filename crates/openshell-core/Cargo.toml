@@ -38,6 +38,11 @@ default = ["telemetry"]
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
 telemetry = ["dep:reqwest", "dep:chrono"]
+## Adds the `ComputeDriverKind::DockerSandboxes` builtin variant. Off by
+## default — `docker-sandboxes` ships out-of-tree; this exists so
+## `openshell-server`'s `docker-sandboxes-in-tree` feature can embed it in a
+## single gateway binary for local development.
+docker-sandboxes = []
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

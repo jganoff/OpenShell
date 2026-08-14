@@ -19,3 +19,7 @@ run = "bash tasks/scripts/gateway-docker.sh"
 ["gateway:vm"]
 description = "Run a standalone gateway with the bundled VM compute driver"
 run = "bash tasks/scripts/gateway-vm.sh"
+
+["gateway:docker-sandboxes"]
+description = "Run a standalone gateway with the Docker Sandboxes compute driver"
+run = "bash tasks/scripts/gateway-docker-sandboxes.sh"

@@ -43,6 +43,18 @@ pub struct DriverStartupContext<'a> {
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
+/// Local-development convenience only — see the `docker-sandboxes-in-tree`
+/// feature doc comment in `Cargo.toml`.
+#[cfg(feature = "docker-sandboxes-in-tree")]
+pub fn docker_sandboxes_config_from_context(
+    context: DriverStartupContext<'_>,
+) -> Result<openshell_driver_docker_sandboxes::DockerSandboxesComputeConfig> {
+    driver_config_from_context(
+        context,
+        openshell_core::ComputeDriverKind::DockerSandboxes.as_str(),
+    )
+}
+
 pub fn remote_driver_config_from_context(
     context: DriverStartupContext<'_>,
     name: &str,

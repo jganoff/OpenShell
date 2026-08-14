@@ -747,15 +747,17 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
         [driver] => {
             let driver = openshell_core::config::normalize_compute_driver_name(driver)
                 .map_err(|err| miette::miette!("{err}"))?;
+            let driver_kind = driver.parse::<ComputeDriverKind>().ok();
             if matches!(
-                driver.parse::<ComputeDriverKind>().ok(),
+                driver_kind,
                 Some(
                     ComputeDriverKind::Docker
                         | ComputeDriverKind::Podman
                         | ComputeDriverKind::Kubernetes
                         | ComputeDriverKind::Vm
                 )
-            ) {
+            ) || is_docker_sandboxes_in_tree(driver_kind)
+            {
                 return Err(miette::miette!(
                     "--compute-driver-socket cannot be combined with reserved built-in compute driver '{driver}'"
                 ));
@@ -768,6 +770,21 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
             drivers.join(",")
         )),
     }
+}
+
+/// `docker-sandboxes` is only a reserved built-in name when compiled with
+/// `docker-sandboxes-in-tree` (see that feature's doc comment in
+/// `Cargo.toml`) — a released gateway build without it has no
+/// `ComputeDriverKind::DockerSandboxes` variant at all, so the name falls
+/// through to the generic `--compute-driver-socket` remote-driver path.
+#[cfg(feature = "docker-sandboxes-in-tree")]
+fn is_docker_sandboxes_in_tree(driver_kind: Option<ComputeDriverKind>) -> bool {
+    matches!(driver_kind, Some(ComputeDriverKind::DockerSandboxes))
+}
+
+#[cfg(not(feature = "docker-sandboxes-in-tree"))]
+fn is_docker_sandboxes_in_tree(_driver_kind: Option<ComputeDriverKind>) -> bool {
+    false
 }
 
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {

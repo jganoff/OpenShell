@@ -1,0 +1,26 @@
+{
+  "manifest": {
+    "schemaVersion": "2",
+    "kind": "sandbox",
+    "name": "openshell",
+    "displayName": "OpenShell",
+    "description": "OpenShell gateway-managed sandbox. Launches the openshell-sandbox supervisor as a startup hook, which reads the OPENSHELL_* environment injected by the compute driver at create time and connects back to the OpenShell gateway.\n",
+    "template": "docker/sandbox-templates:shell-docker",
+    "security": {
+      "privileged": true
+    }
+  },
+  "commands": {
+    "startup": [
+      {
+        "command": [
+          "sh",
+          "-c",
+          "exec \"$OPENSHELL_DOCKER_SANDBOXES_SUPERVISOR_BIN\" \u003e/var/log/openshell-sandbox.log 2\u003e\u00261"
+        ],
+        "user": "root",
+        "background": true
+      }
+    ]
+  }
+}

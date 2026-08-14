@@ -124,6 +124,12 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    /// Only exists when built with `docker-sandboxes-in-tree` — this driver
+    /// ships out-of-tree by default (see `openshell-driver-docker-sandboxes`)
+    /// and this variant exists purely as a local-dev convenience so it can
+    /// also run embedded in a single gateway binary.
+    #[cfg(feature = "docker-sandboxes")]
+    DockerSandboxes,
 }
 
 impl ComputeDriverKind {
@@ -134,6 +140,8 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            #[cfg(feature = "docker-sandboxes")]
+            Self::DockerSandboxes => "docker-sandboxes",
         }
     }
 }
@@ -165,6 +173,11 @@ impl fmt::Display for ComputeDriverKind {
     }
 }
 
+#[cfg(feature = "docker-sandboxes")]
+const BUILTIN_DRIVER_NAMES: &str = "kubernetes, vm, docker, podman, docker-sandboxes";
+#[cfg(not(feature = "docker-sandboxes"))]
+const BUILTIN_DRIVER_NAMES: &str = "kubernetes, vm, docker, podman";
+
 impl FromStr for ComputeDriverKind {
     type Err = String;
 
@@ -174,8 +187,10 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            #[cfg(feature = "docker-sandboxes")]
+            "docker-sandboxes" => Ok(Self::DockerSandboxes),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: {BUILTIN_DRIVER_NAMES}"
             )),
         }
     }

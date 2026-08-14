@@ -202,6 +202,42 @@ jobs:
             --all-targets \
             -- -D warnings
 
+  rust-windows:
+    name: Rust (Windows)
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Windows Rust comes from rustup, not mise — see
+      # architecture/windows-msvc-build.md.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: rust-checks-windows
+          cache-on-failure: "true"
+
+      # The full Windows MSVC workspace lane stays manually dispatched
+      # (.github/workflows/windows-msvc.yml) until its cache-hit runtimes are
+      # PR-suitable. This guard is deliberately narrow: it keeps the crates
+      # carrying real #[cfg(windows)] transport code — currently the sandboxd
+      # named-pipe client — compiled and executed on every change, which no
+      # Linux or macOS job can do. Formatting is target-independent and already
+      # checked by the Linux jobs.
+      - name: Lint Windows-sensitive crates
+        run: cargo clippy -p openshell-driver-docker-sandboxes --all-targets -- -D warnings
+
+      - name: Test Windows-sensitive crates
+        run: cargo test -p openshell-driver-docker-sandboxes
+
   python:
     name: Python (${{ matrix.runner }})
     needs: pr_metadata

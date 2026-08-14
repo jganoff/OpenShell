@@ -1,0 +1,49 @@
+schemaVersion: "2"
+kind: sandbox
+name: openshell
+displayName: OpenShell
+description: >
+  OpenShell gateway-managed sandbox. Launches the openshell-sandbox
+  supervisor as a startup hook, which reads the OPENSHELL_* environment
+  injected by the compute driver at create time and connects back to the
+  OpenShell gateway.
+sandbox:
+  # Documentation only — the compute driver always overrides `template` on
+  # the create request itself (`DockerSandboxesComputeConfig::template_image`,
+  # defaulting to a driver-built image derived from this same base plus the
+  # packages/user it's missing — see
+  # `openshell-driver-docker-sandboxes::base_image`), so this field's value
+  # here is never actually requested.
+  image: "docker/sandbox-templates:shell-docker"
+security:
+  # The supervisor creates its own network namespace to enforce L7 egress
+  # policy (CAP_NET_ADMIN/CAP_SYS_ADMIN + write access to /run/netns), which
+  # a non-privileged sandboxd container doesn't grant.
+  privileged: true
+setup:
+  startup:
+    # sandboxd's generic kit-agent path never execs a kit's own
+    # `manifest.binary` as the container's entrypoint — it always forces the
+    # container Cmd to its own long-running wrapper, then runs this startup
+    # command against the already-up container. `user: root` is what
+    # actually grants the supervisor its capabilities (confirmed live:
+    # CapEff is the full set as root here, zero as the image's default user
+    # even under `security.privileged` above). The env var is set by the
+    # compute driver on the create request itself and names the host path
+    # `additional_workspaces` injects the supervisor binary at — see
+    # `openshell-driver-docker-sandboxes::supervisor`.
+    #
+    # `background: true` is a documented `StartupCommand` field (confirmed
+    # via `sbx kit validate`/`sbx kit inspect`): a foreground `exec` here is
+    # tied to (and killed with) the startup step's own process tree, but
+    # `background: true` reparents the command to the container's PID 1 and
+    # keeps it running indefinitely — confirmed live with a counter that
+    # kept incrementing for as long as the sandbox itself ran.
+    - command:
+        [
+          "sh",
+          "-c",
+          "exec \"$OPENSHELL_DOCKER_SANDBOXES_SUPERVISOR_BIN\" >/var/log/openshell-sandbox.log 2>&1",
+        ]
+      user: "root"
+      background: true

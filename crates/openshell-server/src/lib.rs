@@ -928,6 +928,21 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "docker-sandboxes-in-tree")]
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::DockerSandboxes) => {
+            let docker_sandboxes_config =
+                compute::driver_config::docker_sandboxes_config_from_context(driver_startup)?;
+            ComputeRuntime::new_docker_sandboxes(
+                config.clone(),
+                docker_sandboxes_config,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+        }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
