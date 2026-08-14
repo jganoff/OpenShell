@@ -50,7 +50,6 @@ An unknown profile name fails the create with a clear error.
 
 ## Known limitations
 
-- **Locally-built images aren't visible yet.** `openshell sandbox create --from <Dockerfile>` needs the image pushed to a registry first; a registry-resolvable `template.image` works as-is.
 - **No GPU support yet.**
 - **No generalized out-of-process auto-spawn yet.** `docker-sandboxes-in-tree` is a local-dev stopgap.
 
@@ -65,6 +64,8 @@ openshell-gateway ──gRPC──▶ driver ──HTTP (UDS)──▶ sandboxd 
 The driver talks to `sandboxd` over its local socket to create, list, stop, start, and delete sandboxes. Each sandbox runs the OpenShell supervisor, which connects back to the gateway directly — the driver isn't on that path.
 
 The driver starts the supervisor via a kit startup command once the sandbox is already up, on top of a small default image it builds itself the first time it runs and reuses afterward; the supervisor binary itself is fetched from a release and injected into every sandbox at create time. See `base_image.rs` and `supervisor.rs`.
+
+`template.image` normally comes straight from a registry `sandboxd` pulls itself. `openshell sandbox create --from <Dockerfile>` works too: if the image isn't registry-resolvable, the driver looks for it in a local Docker Engine and loads it into `sandboxd`'s own image store before retrying. See `local_image.rs`.
 
 ## Contract conformance
 

@@ -41,6 +41,7 @@ reqwest = { workspace = true }
 tar = "0.4"
 flate2 = "1"
 sha2 = { workspace = true }
+bollard = { version = "0.20", default-features = false, features = ["pipe"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

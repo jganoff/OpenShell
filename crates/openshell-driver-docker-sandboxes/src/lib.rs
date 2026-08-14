@@ -38,6 +38,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 mod base_image;
+mod local_image;
 mod supervisor;
 
 const WATCH_BUFFER: usize = 128;
@@ -548,6 +549,20 @@ impl DockerSandboxesComputeDriver {
         path: &str,
         body: Option<Bytes>,
     ) -> Result<(u16, Bytes), Status> {
+        self.daemon_request_with_content_type(method, path, body, "application/json")
+            .await
+    }
+
+    /// Like [`Self::daemon_request`], but with an explicit content type —
+    /// for a request whose body isn't JSON (loading a `docker save` tar
+    /// into sandboxd's own image store; see `local_image`).
+    async fn daemon_request_with_content_type(
+        &self,
+        method: http::Method,
+        path: &str,
+        body: Option<Bytes>,
+        content_type: &str,
+    ) -> Result<(u16, Bytes), Status> {
         let io = self.connect_daemon().await?;
 
         let (mut sender, conn) = http1::handshake(io)
@@ -571,7 +586,7 @@ impl DockerSandboxesComputeDriver {
 
         if content_length > 0 {
             builder = builder
-                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::CONTENT_TYPE, content_type)
                 .header(http::header::CONTENT_LENGTH, content_length);
         }
 
@@ -593,6 +608,87 @@ impl DockerSandboxesComputeDriver {
             .unwrap_or_default();
 
         Ok((status, resp_bytes))
+    }
+
+    /// Load a `docker save`-format tar into sandboxd's own image store —
+    /// the same endpoint `sbx template load` uses. `image` is the tag the
+    /// caller expects to resolve afterward; a 200 from the load endpoint
+    /// doesn't guarantee the tar actually decoded to that tag (Docker's own
+    /// load API can report a failure inside an otherwise-200 body), so this
+    /// confirms via the same inspect endpoint `ensure_base_image_loaded`
+    /// uses.
+    async fn load_image_tar(&self, image: &str, tar: Bytes) -> Result<(), Status> {
+        let (status, body) = self
+            .daemon_request_with_content_type(
+                http::Method::POST,
+                "/docker/images/load",
+                Some(tar),
+                "application/octet-stream",
+            )
+            .await?;
+        if status != 200 {
+            return Err(Status::internal(format!(
+                "sandboxd image load returned HTTP {status}: {}",
+                String::from_utf8_lossy(&body)
+            )));
+        }
+
+        let (inspect_status, _) = self
+            .daemon_request(
+                http::Method::GET,
+                &format!("/docker/images/inspect?name={image}"),
+                None,
+            )
+            .await?;
+        if inspect_status == 200 {
+            Ok(())
+        } else {
+            Err(Status::internal(format!(
+                "sandboxd image load returned HTTP 200 but '{image}' still isn't in its image store"
+            )))
+        }
+    }
+
+    /// Remove an image from sandboxd's own image store — used to clean up
+    /// a `local_image` fallback load when the retried create it was for
+    /// still failed, so a failed attempt doesn't leave a large orphaned
+    /// image behind. Best-effort: a failure here only means sandboxd's
+    /// store has one more image than it should, not a functional problem,
+    /// so it's logged rather than propagated.
+    async fn remove_loaded_image(&self, image: &str) {
+        let result = self
+            .daemon_request(
+                http::Method::DELETE,
+                &format!("/docker/images/remove?name={image}"),
+                None,
+            )
+            .await;
+        match result {
+            Ok((200, _)) => {}
+            Ok((status, body)) => warn!(
+                image_ref = image,
+                status,
+                body = %String::from_utf8_lossy(&body),
+                "failed to remove a local_image fallback load after its retried create failed"
+            ),
+            Err(err) => warn!(
+                image_ref = image,
+                error = %err,
+                "failed to remove a local_image fallback load after its retried create failed"
+            ),
+        }
+    }
+
+    /// Send a `SandboxCreateReq` and return the raw response, without
+    /// interpreting the status code — shared by `create_inner`'s first
+    /// attempt and its retry after a `local_image` fallback load.
+    async fn post_sandbox_create(
+        &self,
+        req: &SandboxCreateReq<'_>,
+    ) -> Result<(u16, Bytes), Status> {
+        let body = serde_json::to_vec(req).map_err(|e| Status::internal(format!("json: {e}")))?;
+        self.daemon_request(http::Method::POST, "/sandbox", Some(Bytes::from(body)))
+            .await
     }
 
     // ── HTTP helpers ───────────────────────────────────────────────────────
@@ -822,24 +918,46 @@ impl DockerSandboxesComputeDriver {
         };
 
         let result = async {
-            let body =
-                serde_json::to_vec(&req).map_err(|e| Status::internal(format!("json: {e}")))?;
+            let (status, resp_body) = self.post_sandbox_create(&req).await?;
 
-            let (status, resp_body) = self
-                .daemon_request(http::Method::POST, "/sandbox", Some(Bytes::from(body)))
-                .await?;
-
-            match status {
-                201 => Ok(()),
-                409 => Err(Status::already_exists("sandbox already exists")),
-                503 => Err(Status::unavailable("sandboxd is degraded")),
-                code => {
-                    let msg = String::from_utf8_lossy(&resp_body);
-                    Err(Status::internal(format!(
-                        "sandboxd create returned HTTP {code}: {msg}"
-                    )))
-                }
+            // sandboxd resolves a registry-resolvable `template.image`
+            // itself; this specific failure means it couldn't. The only
+            // case worth checking a local Docker Engine for is a
+            // locally-built image from `openshell sandbox create --from
+            // <Dockerfile>` — see `local_image`.
+            if local_image::is_image_pull_failure(status, &resp_body) {
+                return match self
+                    .try_load_image_from_local_docker_engine(template_override)
+                    .await
+                {
+                    Ok(true) => {
+                        let (retry_status, retry_body) = self.post_sandbox_create(&req).await?;
+                        let retry_result = create_status_to_result(
+                            retry_status,
+                            &retry_body,
+                            " after loading it from a local Docker Engine",
+                        );
+                        if retry_result.is_err() {
+                            // Don't leave the image this call just loaded
+                            // sitting in sandboxd's store — nothing else
+                            // will ever clean it up.
+                            self.remove_loaded_image(template_override).await;
+                        }
+                        retry_result
+                    }
+                    Ok(false) => Err(Status::failed_precondition(format!(
+                        "template image '{template_override}' isn't in sandboxd's own image \
+                         store and sandboxd couldn't pull it from a registry: {}",
+                        String::from_utf8_lossy(&resp_body)
+                    ))),
+                    Err(err) => Err(Status::internal(format!(
+                        "failed to load '{template_override}' from a local Docker Engine into \
+                         sandboxd: {err}"
+                    ))),
+                };
             }
+
+            create_status_to_result(status, &resp_body, "")
         }
         .await;
         if result.is_err() {
@@ -1182,6 +1300,25 @@ impl ComputeDriver for DockerSandboxesComputeDriver {
 }
 
 // ── Free functions ─────────────────────────────────────────────────────────
+
+/// Map a `POST /sandbox` response's status code to a `Result` — shared by
+/// `create_inner`'s first attempt and its retry after a `local_image`
+/// fallback load. `context` is appended to the generic-failure message
+/// (e.g. `" after loading it from a local Docker Engine"` for the retry),
+/// empty on the first attempt.
+fn create_status_to_result(status: u16, body: &Bytes, context: &str) -> Result<(), Status> {
+    match status {
+        201 => Ok(()),
+        409 => Err(Status::already_exists("sandbox already exists")),
+        503 => Err(Status::unavailable("sandboxd is degraded")),
+        code => {
+            let msg = String::from_utf8_lossy(body);
+            Err(Status::internal(format!(
+                "sandboxd create returned HTTP {code}{context}: {msg}"
+            )))
+        }
+    }
+}
 
 /// Host path a gateway-minted sandbox JWT is written to before create, and
 /// injected into the sandbox at the identical container path via

@@ -3771,6 +3771,7 @@ dependencies = [
 name = "openshell-driver-docker-sandboxes"
 version = "0.0.0"
 dependencies = [
+ "bollard",
  "bytes",
  "clap",
  "flate2",
