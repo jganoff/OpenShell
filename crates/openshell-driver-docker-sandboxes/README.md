@@ -53,7 +53,6 @@ An unknown profile name fails the create with a clear error.
 - **Locally-built images aren't visible yet.** `openshell sandbox create --from <Dockerfile>` needs the image pushed to a registry first; a registry-resolvable `template.image` works as-is.
 - **No GPU support yet.**
 - **No generalized out-of-process auto-spawn yet.** `docker-sandboxes-in-tree` is a local-dev stopgap.
-- **Sandbox boot time scales with host load.** Under heavy load, `openshell sandbox create` can time out client-side before the sandbox actually finishes booting — check `sbx exec <name> -- cat /var/log/openshell-sandbox.log` before assuming failure.
 
 ## Architecture
 
