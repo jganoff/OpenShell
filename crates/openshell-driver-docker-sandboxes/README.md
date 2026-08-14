@@ -61,7 +61,7 @@ openshell-gateway ──gRPC──▶ driver ──HTTP (UDS)──▶ sandboxd 
         └──────────────── supervisor connects back ────────────────┘
 ```
 
-The driver talks to `sandboxd` over its local socket to create, list, stop, start, and delete sandboxes. Each sandbox runs the OpenShell supervisor, which connects back to the gateway directly — the driver isn't on that path.
+The driver talks to `sandboxd` over its local socket to create, list, stop, start, and delete sandboxes. Create includes an explicit start step so the supervisor comes up immediately, and every sandbox is created detached, so its lifetime is owned by the driver rather than by whether anything happens to be attached to it. Each sandbox runs the OpenShell supervisor, which connects back to the gateway directly — the driver isn't on that path.
 
 The driver starts the supervisor via a kit startup command once the sandbox is already up, on top of a small default image it builds itself the first time it runs and reuses afterward; the supervisor binary itself is fetched from a release and injected into every sandbox at create time. See `base_image.rs` and `supervisor.rs`.
 

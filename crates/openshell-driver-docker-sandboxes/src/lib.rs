@@ -100,6 +100,17 @@ struct SandboxCreateReq<'a> {
     workspace: &'a str,
     name: &'a str,
     template: &'a str,
+    /// Always `true`. Without this, sandboxd auto-stops the runtime 30
+    /// seconds after the last `sbx`-tracked exec/attach session
+    /// disconnects (confirmed live and against sandboxd's own source,
+    /// `backend_dockernext.go`'s `holdSession`/`autoStopDelay`) — and the
+    /// supervisor's own connection back to the gateway is never such a
+    /// session, so sandboxd has no way to know the sandbox is still in
+    /// active use. `detached` is exactly the flag `sbx run -d` sets for
+    /// the same reason: this sandbox's lifetime is owned by the driver
+    /// (stop/start/delete), not by whether anyone happens to be attached
+    /// to it right now.
+    detached: bool,
     /// Named governance profile to assign, resolved by `resolve_profile`.
     /// sandboxd canonicalizes this against the active (remote/org-managed)
     /// governance policy set and rejects unknown names at create time.
@@ -909,6 +920,7 @@ impl DockerSandboxesComputeDriver {
             workspace: workspace_dir,
             name: &encoded_name,
             template: template_override,
+            detached: true,
             profile,
             cpus: validated.cpus,
             memory: validated.memory.as_deref(),
@@ -917,7 +929,7 @@ impl DockerSandboxesComputeDriver {
             kit_artifacts: vec![kit_artifact],
         };
 
-        let result = async {
+        let mut result = async {
             let (status, resp_body) = self.post_sandbox_create(&req).await?;
 
             // sandboxd resolves a registry-resolvable `template.image`
@@ -960,6 +972,56 @@ impl DockerSandboxesComputeDriver {
             create_status_to_result(status, &resp_body, "")
         }
         .await;
+
+        if result.is_ok() {
+            // sandboxd's `POST /sandbox` only provisions the container —
+            // the kit's startup hook (which launches the supervisor) is
+            // dispatched by its `start` endpoint, not by create. Confirmed
+            // against sandboxd's own source: `Provision`/`Run` never
+            // invoke the durable-startup dispatcher, only a later `Start`
+            // call does (the same one `start_inner` issues for
+            // `StartSandbox`). Without this call here, the supervisor
+            // never runs until something else happens to call `start`
+            // first — a manual `sbx exec`/`sbx run` does this as a side
+            // effect, which is why a sandbox otherwise looks "stuck" until
+            // someone execs into it by hand.
+            let start_path = format!("/sandbox/{encoded_name}/start");
+            result = match self
+                .daemon_request(http::Method::POST, &start_path, None)
+                .await
+            {
+                Ok((200, _)) => Ok(()),
+                Ok((status, body)) => Err(Status::internal(format!(
+                    "sandboxd start (to dispatch the kit's startup hook) returned HTTP \
+                     {status}: {}",
+                    String::from_utf8_lossy(&body)
+                ))),
+                Err(err) => Err(err),
+            };
+            if let Err(ref err) = result {
+                // The container exists but its startup hook never got
+                // dispatched — not a usable sandbox. Best-effort delete so
+                // the caller can retry cleanly instead of being left with
+                // a zombie entry that looks created but will never boot.
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %err,
+                    "sandbox startup-hook dispatch failed; deleting the unusable sandbox"
+                );
+                let delete_path = format!("/sandbox/{encoded_name}");
+                if let Err(delete_err) = self
+                    .daemon_request(http::Method::DELETE, &delete_path, None)
+                    .await
+                {
+                    warn!(
+                        sandbox_id = %sandbox.id,
+                        error = %delete_err,
+                        "failed to clean up a sandbox whose startup-hook dispatch failed"
+                    );
+                }
+            }
+        }
+
         if result.is_err() {
             // The sandbox token is only usable while sandboxd actually
             // knows about this sandbox — leaving it on disk after a
