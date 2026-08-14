@@ -94,6 +94,15 @@ struct DaemonHealth {
     version: String,
 }
 
+/// Response shape for `POST /policy/network/check` — a subset of
+/// sandboxd's `PolicyCheckResponse`. See `verify_gateway_network_policy`.
+#[derive(Debug, Deserialize)]
+struct PolicyCheckResponse {
+    allowed: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct SandboxCreateReq<'a> {
     agent: &'a str,
@@ -702,6 +711,74 @@ impl DockerSandboxesComputeDriver {
             .await
     }
 
+    /// Ask sandboxd's own `/policy/network/check` diagnostic whether the
+    /// just-created sandbox will actually be able to reach
+    /// `openshell_endpoint` — the same target `inject_gateway_network_allow`
+    /// asked it to allow at create time. That allow is a kit-declared rule,
+    /// and sandboxd silently deactivates a kit-declared rule (no error, just
+    /// a log line on sandboxd's own side) whenever it conflicts with active
+    /// org-managed governance — so create can succeed and the allow can
+    /// still not be in effect. Without this check, the only symptom is the
+    /// sandbox sitting in `Provisioning` forever, indistinguishable from any
+    /// other stuck-supervisor cause.
+    ///
+    /// Returns `Err` only for a definite policy denial — an actionable,
+    /// diagnosable failure worth rejecting the create over. Any failure to
+    /// perform the check itself (older sandboxd without this endpoint,
+    /// transport error, unexpected response shape) is logged and treated as
+    /// "couldn't confirm either way," not as a denial — this check is
+    /// strictly additive diagnosis, never a new way for create to fail that
+    /// didn't exist before it.
+    async fn verify_gateway_network_policy(
+        &self,
+        sandboxd_name: &str,
+        target: &str,
+    ) -> Result<(), Status> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "network",
+            "target": target,
+            "sandbox_id": sandboxd_name,
+        }))
+        .expect("static JSON shape always serializes");
+        let (status, resp_body) = match self
+            .daemon_request(
+                http::Method::POST,
+                "/policy/network/check",
+                Some(Bytes::from(body)),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    sandbox_id = sandboxd_name,
+                    target,
+                    error = %err,
+                    "couldn't confirm gateway network policy via sandboxd's /policy/network/check; proceeding without it"
+                );
+                return Ok(());
+            }
+        };
+        if status != 200 {
+            warn!(
+                sandbox_id = sandboxd_name,
+                target,
+                status,
+                body = %String::from_utf8_lossy(&resp_body),
+                "sandboxd's /policy/network/check returned an unexpected status; proceeding without it"
+            );
+            return Ok(());
+        }
+        policy_check_response_result(target, &resp_body).unwrap_or_else(|| {
+            warn!(
+                sandbox_id = sandboxd_name,
+                target,
+                "couldn't parse sandboxd's /policy/network/check response; proceeding without it"
+            );
+            Ok(())
+        })
+    }
+
     // ── HTTP helpers ───────────────────────────────────────────────────────
 
     async fn list_infos(&self) -> Result<Vec<SandboxInfo>, Status> {
@@ -998,15 +1075,33 @@ impl DockerSandboxesComputeDriver {
                 ))),
                 Err(err) => Err(err),
             };
+
+            if result.is_ok() {
+                // The kit-declared network allow `inject_gateway_network_allow`
+                // asked for at create time can be silently deactivated by
+                // active org governance (sandboxd logs a warning on its own
+                // side, nothing reaches us) — confirming it actually took
+                // effect here turns "stuck in Provisioning forever" into a
+                // clear error at create time.
+                if let Ok(target) =
+                    openshell_endpoint_policy_target(&self.config.openshell_endpoint)
+                {
+                    result = self
+                        .verify_gateway_network_policy(&encoded_name, &target)
+                        .await;
+                }
+            }
+
             if let Err(ref err) = result {
-                // The container exists but its startup hook never got
-                // dispatched — not a usable sandbox. Best-effort delete so
-                // the caller can retry cleanly instead of being left with
-                // a zombie entry that looks created but will never boot.
+                // The container exists but isn't usable — either the
+                // startup hook never got dispatched, or its network policy
+                // check failed. Best-effort delete so the caller can retry
+                // cleanly instead of being left with a zombie entry that
+                // looks created but will never work.
                 warn!(
                     sandbox_id = %sandbox.id,
                     error = %err,
-                    "sandbox startup-hook dispatch failed; deleting the unusable sandbox"
+                    "sandbox isn't usable after create; deleting it"
                 );
                 let delete_path = format!("/sandbox/{encoded_name}");
                 if let Err(delete_err) = self
@@ -1016,7 +1111,7 @@ impl DockerSandboxesComputeDriver {
                     warn!(
                         sandbox_id = %sandbox.id,
                         error = %delete_err,
-                        "failed to clean up a sandbox whose startup-hook dispatch failed"
+                        "failed to clean up a sandbox that isn't usable"
                     );
                 }
             }
@@ -1382,6 +1477,25 @@ fn create_status_to_result(status: u16, body: &Bytes, context: &str) -> Result<(
     }
 }
 
+/// Interpret a `/policy/network/check` response body into a create-time
+/// result. `None` if `body` doesn't parse as a [`PolicyCheckResponse`] —
+/// the caller treats that the same as any other failure to perform the
+/// check itself (see `verify_gateway_network_policy`): "couldn't confirm
+/// either way," not a denial. `Some(Err(_))` only for a definite
+/// `allowed: false`.
+fn policy_check_response_result(target: &str, body: &[u8]) -> Option<Result<(), Status>> {
+    let check = serde_json::from_slice::<PolicyCheckResponse>(body).ok()?;
+    if check.allowed {
+        return Some(Ok(()));
+    }
+    Some(Err(Status::failed_precondition(format!(
+        "sandboxd's network policy denies this sandbox outbound access to the OpenShell \
+         gateway ({target}), so its supervisor will never be able to connect: {}. Whoever \
+         manages network governance for this installation needs to allow it.",
+        check.reason.as_deref().unwrap_or("denied by policy")
+    ))))
+}
+
 /// Host path a gateway-minted sandbox JWT is written to before create, and
 /// injected into the sandbox at the identical container path via
 /// `additional_workspaces` (see `create_inner`). Shares the same
@@ -1733,12 +1847,11 @@ fn parse_kubernetes_quantity_bytes(value: &str) -> Option<u64> {
     }
 }
 
-/// Add a `caps.network.allow` entry for `openshell_endpoint` to the kit artifact
-/// JSON. Format matches sandboxd's kit egress schema: exact `host:port`.
-fn inject_gateway_network_allow(
-    kit_artifact: &mut serde_json::Value,
-    openshell_endpoint: &str,
-) -> Result<(), Status> {
+/// Resolve `openshell_endpoint` to the exact `host:port` string sandboxd's
+/// policy engine matches against — both for the `caps.network.allow` entry
+/// this driver injects, and for later asking sandboxd's own `/policy/
+/// network/check` whether that entry actually took effect.
+fn openshell_endpoint_policy_target(openshell_endpoint: &str) -> Result<String, Status> {
     let parsed = url::Url::parse(openshell_endpoint).map_err(|e| {
         Status::internal(format!(
             "openshell_endpoint {openshell_endpoint:?} is not a valid URL: {e}"
@@ -1763,7 +1876,17 @@ fn inject_gateway_network_allow(
     } else {
         host
     };
-    let allow_entry = serde_json::Value::String(format!("{policy_host}:{port}"));
+    Ok(format!("{policy_host}:{port}"))
+}
+
+/// Add a `caps.network.allow` entry for `openshell_endpoint` to the kit artifact
+/// JSON. Format matches sandboxd's kit egress schema: exact `host:port`.
+fn inject_gateway_network_allow(
+    kit_artifact: &mut serde_json::Value,
+    openshell_endpoint: &str,
+) -> Result<(), Status> {
+    let allow_entry =
+        serde_json::Value::String(openshell_endpoint_policy_target(openshell_endpoint)?);
 
     let caps = kit_artifact
         .as_object_mut()
@@ -2387,6 +2510,42 @@ mod tests {
             kit_artifact["caps"]["network"]["allow"],
             serde_json::json!(["existing.example.com:443", "localhost:17670"])
         );
+    }
+
+    #[test]
+    fn policy_check_response_result_allows_a_permitted_target() {
+        let body = br#"{"allowed":true,"type":"network","target":"localhost:18082","action":"net:connect:tcp","resource_type":"net:domain","resource_value":"localhost:18082","context":"sandbox"}"#;
+        assert!(
+            policy_check_response_result("localhost:18082", body)
+                .expect("parses")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn policy_check_response_result_denies_a_blocked_target_with_the_reason() {
+        let body = br#"{"allowed":false,"reason":"denied by org governance","type":"network","target":"localhost:18082","action":"net:connect:tcp","resource_type":"net:domain","resource_value":"localhost:18082","context":"sandbox"}"#;
+        let err = policy_check_response_result("localhost:18082", body)
+            .expect("parses")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("denied by org governance"));
+        assert!(err.message().contains("localhost:18082"));
+    }
+
+    #[test]
+    fn policy_check_response_result_denies_without_a_reason() {
+        let body = br#"{"allowed":false,"type":"network","target":"localhost:18082","action":"net:connect:tcp","resource_type":"net:domain","resource_value":"localhost:18082","context":"sandbox"}"#;
+        let err = policy_check_response_result("localhost:18082", body)
+            .expect("parses")
+            .unwrap_err();
+        assert!(err.message().contains("denied by policy"));
+    }
+
+    #[test]
+    fn policy_check_response_result_is_none_for_an_unparseable_body() {
+        assert!(policy_check_response_result("localhost:18082", b"not json").is_none());
+        assert!(policy_check_response_result("localhost:18082", b"{}").is_none());
     }
 
     fn candidates() -> Vec<String> {
